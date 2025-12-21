@@ -1,0 +1,19 @@
+{
+  "name": "image-analysis-lambda",
+  "version": "1.0.0",
+  "description": "Lambda function to analyze images for manipulation using Sightengine API",
+  "main": "image-analysis-handler.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "aws-sdk": "^2.1691.0",
+    "dotenv": "^16.3.1",
+    "uuid": "^9.0.1",
+    "axios": "^1.6.0",
+    "form-data": "^4.0.0"
+  },
+  "author": "",
+  "license": "ISC"
+}
+

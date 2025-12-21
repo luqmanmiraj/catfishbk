@@ -1,0 +1,435 @@
+service: image-analysis
+
+# Use AWS profile from environment or default
+# Set AWS_PROFILE environment variable or use --aws-profile flag
+# Example: AWS_PROFILE=myprofile serverless deploy
+
+provider:
+  name: aws
+  runtime: nodejs18.x
+  region: ${opt:region, 'us-east-1'}
+  stage: ${opt:stage, 'dev'}
+  profile: ${opt:aws-profile, env:AWS_PROFILE, 'default'}
+  deploymentBucket:
+    name: ${self:service}-${self:provider.stage}-deployment-${self:provider.region}
+  memorySize: 512
+  timeout: 29
+  environment:
+    # Optional: If not using Secrets Manager, fallback to environment variables
+    HIVE_API_KEY: ${env:HIVE_API_KEY, ''}
+    HIVE_ENDPOINT: ${env:HIVE_ENDPOINT, 'https://api.thehive.ai/api/v3/chat/completions'}
+    S3_BUCKET_NAME: !Ref ImageBucket
+    # Secrets Manager and SSM configuration
+    HIVE_API_KEY_SECRET_NAME: ${env:HIVE_API_KEY_SECRET_NAME, 'catfish/hive-api-key'}
+    HIVE_ENDPOINT_PARAM_NAME: ${env:HIVE_ENDPOINT_PARAM_NAME, '/catfish/hive-endpoint'}
+    S3_BUCKET_PARAM_NAME: ${env:S3_BUCKET_PARAM_NAME, '/catfish/s3-bucket-name'}
+    # Sightengine deepfake detection thresholds (as percentages)
+    DEEPFAKE_THRESHOLD_AUTHENTIC: ${env:DEEPFAKE_THRESHOLD_AUTHENTIC, '1'}
+    DEEPFAKE_THRESHOLD_DEEPFAKE: ${env:DEEPFAKE_THRESHOLD_DEEPFAKE, '90'}
+    # Cognito configuration
+    COGNITO_USER_POOL_ID: !Ref CognitoUserPool
+    COGNITO_USER_POOL_CLIENT_ID: !Ref CognitoUserPoolClient
+    COGNITO_USER_POOL_DOMAIN: ${self:service}-${self:provider.stage}
+    # RevenueCat configuration
+    REVENUECAT_SECRET_KEY: ${env:REVENUECAT_SECRET_KEY, ''}
+    REVENUECAT_SECRET_NAME: ${env:REVENUECAT_SECRET_NAME, 'catfish/revenuecat-secret-key'}
+    # Gowinston configuration
+    GOWINSTON_TOKEN: ${env:GOWINSTON_TOKEN, ''}
+    # DynamoDB table names
+    SUBSCRIPTIONS_TABLE: ${self:service}-${self:provider.stage}-subscriptions
+    SCAN_COUNTS_TABLE: ${self:service}-${self:provider.stage}-scan-counts
+    SCAN_HISTORY_TABLE: ${self:service}-${self:provider.stage}-scan-history
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - s3:PutObject
+            - s3:PutObjectAcl
+            - s3:GetObject
+          Resource:
+            - !Sub 'arn:aws:s3:::${ImageBucket}/*'
+            # Allow access to all S3 buckets (needed when bucket name comes from SSM/env)
+            # In production, restrict this to specific bucket ARNs
+            - 'arn:aws:s3:::*/*'
+        - Effect: Allow
+          Action:
+            - s3:ListBucket
+          Resource:
+            - !Sub 'arn:aws:s3:::${ImageBucket}'
+            - 'arn:aws:s3:::*'
+        - Effect: Allow
+          Action:
+            - secretsmanager:GetSecretValue
+            - secretsmanager:DescribeSecret
+          Resource:
+            # AWS Secrets Manager ARNs include a random suffix, so we need to match the pattern
+            - !Sub 'arn:aws:secretsmanager:${self:provider.region}:*:secret:catfish/*-*'
+            - !Sub 'arn:aws:secretsmanager:${self:provider.region}:*:secret:catfish/*'
+            - !Sub 'arn:aws:secretsmanager:${self:provider.region}:*:secret:catfish/revenuecat-secret-key*'
+        - Effect: Allow
+          Action:
+            - ssm:GetParameter
+            - ssm:GetParameters
+          Resource:
+            - !Sub 'arn:aws:ssm:${self:provider.region}:*:parameter/catfish/*'
+        - Effect: Allow
+          Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+          Resource:
+            - !Sub 'arn:aws:logs:${self:provider.region}:*:log-group:/aws/lambda/${self:service}-${self:provider.stage}-*:*'
+        - Effect: Allow
+          Action:
+            - dynamodb:PutItem
+            - dynamodb:UpdateItem
+            - dynamodb:GetItem
+            - dynamodb:Query
+          Resource:
+            - !Sub 'arn:aws:dynamodb:${self:provider.region}:*:table/${self:service}-${self:provider.stage}-requests'
+            - !Sub 'arn:aws:dynamodb:${self:provider.region}:*:table/${self:service}-${self:provider.stage}-requests/index/*'
+            - !Sub 'arn:aws:dynamodb:${self:provider.region}:*:table/${self:service}-${self:provider.stage}-subscriptions'
+            - !Sub 'arn:aws:dynamodb:${self:provider.region}:*:table/${self:service}-${self:provider.stage}-scan-counts'
+            - !Sub 'arn:aws:dynamodb:${self:provider.region}:*:table/${self:service}-${self:provider.stage}-scan-history'
+            - !Sub 'arn:aws:dynamodb:${self:provider.region}:*:table/${self:service}-${self:provider.stage}-scan-history/index/*'
+        - Effect: Allow
+          Action:
+            - cognito-idp:AdminInitiateAuth
+            - cognito-idp:AdminRespondToAuthChallenge
+            - cognito-idp:AdminGetUser
+            - cognito-idp:AdminCreateUser
+            - cognito-idp:AdminUpdateUserAttributes
+            - cognito-idp:AdminDeleteUser
+            - cognito-idp:AdminSetUserPassword
+            - cognito-idp:ListUsers
+            - cognito-idp:DescribeUserPool
+            - cognito-idp:AssociateSoftwareToken
+            - cognito-idp:VerifySoftwareToken
+            # Client-side authentication operations
+            - cognito-idp:SignUp
+            - cognito-idp:ConfirmSignUp
+            - cognito-idp:ResendConfirmationCode
+            - cognito-idp:InitiateAuth
+            - cognito-idp:RespondToAuthChallenge
+            - cognito-idp:ForgotPassword
+            - cognito-idp:ConfirmForgotPassword
+            - cognito-idp:GetUser
+          Resource:
+            - !Sub 'arn:aws:cognito-idp:${self:provider.region}:*:userpool/*'
+            - !GetAtt CognitoUserPool.Arn
+
+functions:
+  analyzeImage:
+    handler: image-analysis-handler.handler
+    events:
+      - http:
+          path: analyze
+          method: post
+          cors: true
+  auth:
+    handler: auth-handler.handler
+    events:
+      - http:
+          path: auth/signup
+          method: post
+          cors: true
+      - http:
+          path: auth/guest-signup
+          method: post
+          cors: true
+      - http:
+          path: auth/signin
+          method: post
+          cors: true
+      - http:
+          path: auth/confirm-signup
+          method: post
+          cors: true
+      - http:
+          path: auth/resend-confirmation
+          method: post
+          cors: true
+      - http:
+          path: auth/forgot-password
+          method: post
+          cors: true
+      - http:
+          path: auth/confirm-forgot-password
+          method: post
+          cors: true
+      - http:
+          path: auth/refresh-token
+          method: post
+          cors: true
+      - http:
+          path: auth/user
+          method: get
+          cors: true
+  webhook:
+    handler: webhook-handler.handler
+    events:
+      - http:
+          path: webhook
+          method: post
+          cors: true
+  subscription:
+    handler: subscription-handler.handler
+    events:
+      - http:
+          path: subscription/status
+          method: get
+          cors: true
+      - http:
+          path: subscription/check
+          method: post
+          cors: true
+      - http:
+          path: subscription/increment
+          method: post
+          cors: true
+  scanHistory:
+    handler: scan-history-handler.handler
+    events:
+      - http:
+          path: scan-history
+          method: get
+          cors: true
+  gowinston:
+    handler: gowinston-handler.handler
+    events:
+      - http:
+          path: gowinston/detect
+          method: post
+          cors: true
+
+resources:
+  Resources:
+    ImageBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: false
+          BlockPublicPolicy: false
+          IgnorePublicAcls: false
+          RestrictPublicBuckets: false
+        CorsConfiguration:
+          CorsRules:
+            - AllowedHeaders:
+                - '*'
+              AllowedMethods:
+                - GET
+                - PUT
+                - POST
+                - HEAD
+              AllowedOrigins:
+                - '*'
+              ExposedHeaders:
+                - ETag
+              MaxAge: 3000
+    ImageBucketPolicy:
+      Type: AWS::S3::BucketPolicy
+      Properties:
+        Bucket: !Ref ImageBucket
+        PolicyDocument:
+          Statement:
+            - Sid: PublicReadGetObject
+              Effect: Allow
+              Principal: '*'
+              Action: 's3:GetObject'
+              Resource: !Sub 'arn:aws:s3:::${ImageBucket}/*'
+    RequestTrackingTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:service}-${self:provider.stage}-requests
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: deviceId
+            AttributeType: S
+          - AttributeName: timestamp
+            AttributeType: S
+        KeySchema:
+          - AttributeName: deviceId
+            KeyType: HASH
+          - AttributeName: timestamp
+            KeyType: RANGE
+        GlobalSecondaryIndexes:
+          - IndexName: timestamp-index
+            KeySchema:
+              - AttributeName: timestamp
+                KeyType: HASH
+            Projection:
+              ProjectionType: ALL
+    # Cognito User Pool with Passkeys (WebAuthn) and Email fallback
+    CognitoUserPool:
+      Type: AWS::Cognito::UserPool
+      Properties:
+        UserPoolName: ${self:service}-${self:provider.stage}-user-pool
+        # Use UsernameAttributes for email-based authentication (only one of AliasAttributes or UsernameAttributes allowed)
+        UsernameAttributes:
+          - email
+        UsernameConfiguration:
+          CaseSensitive: false
+        AutoVerifiedAttributes:
+          - email
+        EmailConfiguration:
+          EmailSendingAccount: COGNITO_DEFAULT
+        Policies:
+          PasswordPolicy:
+            MinimumLength: 8
+            RequireUppercase: true
+            RequireLowercase: true
+            RequireNumbers: true
+            RequireSymbols: false
+        # Enable passkeys/WebAuthn as primary sign-in method
+        UserPoolAddOns:
+          AdvancedSecurityMode: OFF
+        Schema:
+          - Name: email
+            Required: true
+            Mutable: true
+          - Name: name
+            Required: false
+            Mutable: true
+          # Custom attributes for guest users
+          # Note: These can only be added to a NEW User Pool, not an existing one
+          # If your User Pool already exists, add these manually via AWS Console:
+          # AWS Console > Cognito > User Pools > [Your Pool] > Sign-up experience > Attributes
+          - AttributeDataType: String
+            Name: device_id
+            Required: false
+            Mutable: true
+          - AttributeDataType: String
+            Name: is_guest
+            Required: false
+            Mutable: true
+        # MFA must be OFF for passwordless authentication (passkeys/email OTP)
+        # Passkeys and Email OTP work with MFA set to OFF
+        # Setting to OPTIONAL requires SMS configuration even if not used
+        MfaConfiguration: OFF
+        AccountRecoverySetting:
+          RecoveryMechanisms:
+            - Name: verified_email
+              Priority: 1
+        VerificationMessageTemplate:
+          DefaultEmailOption: CONFIRM_WITH_CODE
+          EmailSubject: 'Catfish: Verify your email'
+          EmailMessage: 'Your verification code is {####}'
+        UserAttributeUpdateSettings:
+          AttributesRequireVerificationBeforeUpdate:
+            - email
+    # Cognito User Pool Domain (required for WebAuthn/Passkeys)
+    CognitoUserPoolDomain:
+      Type: AWS::Cognito::UserPoolDomain
+      Properties:
+        Domain: ${self:service}-${self:provider.stage}
+        UserPoolId: !Ref CognitoUserPool
+    # Cognito User Pool Client with Passkey and Email authentication flows
+    CognitoUserPoolClient:
+      Type: AWS::Cognito::UserPoolClient
+      Properties:
+        ClientName: ${self:service}-${self:provider.stage}-client
+        UserPoolId: !Ref CognitoUserPool
+        GenerateSecret: false
+        ExplicitAuthFlows:
+          - ALLOW_USER_PASSWORD_AUTH
+          - ALLOW_REFRESH_TOKEN_AUTH
+          - ALLOW_USER_SRP_AUTH
+        SupportedIdentityProviders:
+          - COGNITO
+        PreventUserExistenceErrors: ENABLED
+        TokenValidityUnits:
+          AccessToken: hours
+          IdToken: hours
+          RefreshToken: days
+        AccessTokenValidity: 1
+        IdTokenValidity: 1
+        RefreshTokenValidity: 30
+        # Enable passkey and email sign-in
+        EnableTokenRevocation: true
+        AuthSessionValidity: 3
+        # Enable choice-based sign-in for Passkeys and Email OTP
+        AllowedOAuthFlowsUserPoolClient: false
+        # Note: Passkeys (WebAuthn) must be enabled via AWS Console or API after deployment
+        # See COGNITO_SETUP.md for instructions
+    # Subscriptions DynamoDB Table
+    SubscriptionsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:service}-${self:provider.stage}-subscriptions
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: userId
+            AttributeType: S
+        KeySchema:
+          - AttributeName: userId
+            KeyType: HASH
+        StreamSpecification:
+          StreamViewType: NEW_AND_OLD_IMAGES
+    # Scan Counts DynamoDB Table (tracks scans per user per month)
+    ScanCountsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:service}-${self:provider.stage}-scan-counts
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: userId
+            AttributeType: S
+          - AttributeName: monthKey
+            AttributeType: S
+        KeySchema:
+          - AttributeName: userId
+            KeyType: HASH
+          - AttributeName: monthKey
+            KeyType: RANGE
+        TimeToLiveSpecification:
+          Enabled: true
+          AttributeName: expiresAt
+    # Scan History DynamoDB Table (stores individual scan records)
+    ScanHistoryTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:service}-${self:provider.stage}-scan-history
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: userId
+            AttributeType: S
+          - AttributeName: scanId
+            AttributeType: S
+        KeySchema:
+          - AttributeName: userId
+            KeyType: HASH
+          - AttributeName: scanId
+            KeyType: RANGE
+        TimeToLiveSpecification:
+          Enabled: true
+          AttributeName: expiresAt
+  Outputs:
+    CognitoUserPoolId:
+      Description: Cognito User Pool ID
+      Value: !Ref CognitoUserPool
+      Export:
+        Name: ${self:service}-${self:provider.stage}-user-pool-id
+    CognitoUserPoolArn:
+      Description: Cognito User Pool ARN
+      Value: !GetAtt CognitoUserPool.Arn
+      Export:
+        Name: ${self:service}-${self:provider.stage}-user-pool-arn
+    CognitoUserPoolClientId:
+      Description: Cognito User Pool Client ID
+      Value: !Ref CognitoUserPoolClient
+      Export:
+        Name: ${self:service}-${self:provider.stage}-user-pool-client-id
+    CognitoUserPoolDomain:
+      Description: Cognito User Pool Domain
+      Value: ${self:service}-${self:provider.stage}
+      Export:
+        Name: ${self:service}-${self:provider.stage}-user-pool-domain
+    CognitoAuthUrl:
+      Description: Cognito Hosted UI Auth URL
+      Value: !Sub 
+        - 'https://${Domain}.auth.${Region}.amazoncognito.com'
+        - Domain: ${self:service}-${self:provider.stage}
+          Region: ${self:provider.region}
+      Export:
+        Name: ${self:service}-${self:provider.stage}-auth-url
