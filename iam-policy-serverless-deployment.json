@@ -1,0 +1,46 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ServerlessFrameworkDeploymentBucket",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListBucket",
+        "s3:GetBucketLocation",
+        "s3:GetBucketVersioning",
+        "s3:PutObject",
+        "s3:GetObject",
+        "s3:DeleteObject",
+        "s3:PutObjectAcl",
+        "s3:GetObjectAcl"
+      ],
+      "Resource": [
+        "arn:aws:s3:::image-analysis-*-deployment-*",
+        "arn:aws:s3:::image-analysis-*-deployment-*/*"
+      ]
+    },
+    {
+      "Sid": "ServerlessFrameworkDeploymentBucketGeneric",
+      "Effect": "Allow",
+      "Action": [
+        "s3:CreateBucket",
+        "s3:ListBucket",
+        "s3:GetBucketLocation",
+        "s3:PutObject",
+        "s3:GetObject",
+        "s3:DeleteObject",
+        "s3:PutObjectAcl"
+      ],
+      "Resource": [
+        "arn:aws:s3:::*-deployment-*",
+        "arn:aws:s3:::*-deployment-*/*"
+      ],
+      "Condition": {
+        "StringLike": {
+          "s3:ResourceAccount": "*"
+        }
+      }
+    }
+  ]
+}
+

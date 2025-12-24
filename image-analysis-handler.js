@@ -526,53 +526,80 @@ async function saveScanHistory(userId, scanData) {
 }
 
 /**
- * Increment scan count for user in DynamoDB
+ * Get token balance for user
  */
-async function incrementScanCount(userId) {
+async function getTokenBalance(userId) {
   if (!userId) {
-    console.warn('Cannot increment scan count: userId is missing');
-    return;
+    console.warn('Cannot get token balance: userId is missing');
+    return 0;
   }
 
-  const monthKey = getCurrentMonthKey();
-  // Use SCAN_COUNTS_TABLE environment variable if available, otherwise construct from SERVICE_NAME and STAGE
-  const tableName = process.env.SCAN_COUNTS_TABLE || 
-                    `${process.env.SERVICE_NAME || 'image-analysis'}-${process.env.STAGE || 'dev'}-scan-counts`;
+  const tableName = process.env.TOKENS_TABLE || 
+                    `${process.env.SERVICE_NAME || 'image-analysis'}-${process.env.STAGE || 'dev'}-tokens`;
   
-  console.log(`Attempting to increment scan count - UserId: ${userId}, MonthKey: ${monthKey}, TableName: ${tableName}`);
+  try {
+    const result = await dynamodb.get({
+      TableName: tableName,
+      Key: { userId: userId },
+    }).promise();
+
+    return result.Item ? (result.Item.balance || 0) : 0;
+  } catch (error) {
+    console.error('❌ Error getting token balance:', {
+      error: error.message,
+      code: error.code,
+      userId: userId,
+      tableName: tableName,
+    });
+    return 0; // Return 0 on error to be safe
+  }
+}
+
+/**
+ * Decrement token balance for user (1 token per scan)
+ */
+async function decrementToken(userId) {
+  if (!userId) {
+    console.warn('Cannot decrement token: userId is missing');
+    throw new Error('User ID is required');
+  }
+
+  const tableName = process.env.TOKENS_TABLE || 
+                    `${process.env.SERVICE_NAME || 'image-analysis'}-${process.env.STAGE || 'dev'}-tokens`;
+  
+  console.log(`Attempting to decrement token - UserId: ${userId}, TableName: ${tableName}`);
   
   try {
     const result = await dynamodb.update({
       TableName: tableName,
-      Key: {
-        userId: userId,
-        monthKey: monthKey,
-      },
-      UpdateExpression: 'SET #count = if_not_exists(#count, :zero) + :inc, #updatedAt = :now, #createdAt = if_not_exists(#createdAt, :now)',
+      Key: { userId: userId },
+      UpdateExpression: 'SET #balance = if_not_exists(#balance, :zero) - :dec, #updatedAt = :now',
+      ConditionExpression: '#balance > :zero',
       ExpressionAttributeNames: {
-        '#count': 'count',
+        '#balance': 'balance',
         '#updatedAt': 'updatedAt',
-        '#createdAt': 'createdAt',
       },
       ExpressionAttributeValues: {
         ':zero': 0,
-        ':inc': 1,
+        ':dec': 1,
         ':now': new Date().toISOString(),
       },
-      ReturnValues: 'ALL_NEW', // Return updated item for verification
+      ReturnValues: 'ALL_NEW',
     }).promise();
     
-    console.log(`✅ Scan count incremented successfully for user: ${userId}, month: ${monthKey}, table: ${tableName}`);
-    console.log(`Updated item:`, JSON.stringify(result.Attributes, null, 2));
-    return result.Attributes;
+    console.log(`✅ Token decremented successfully for user: ${userId}, new balance: ${result.Attributes.balance}`);
+    return result.Attributes.balance;
   } catch (error) {
+    if (error.code === 'ConditionalCheckFailedException') {
+      console.warn(`⚠️ User ${userId} has insufficient tokens (balance is 0 or negative)`);
+      throw new Error('Insufficient tokens');
+    }
     // Log detailed error information
-    console.error('❌ Error incrementing scan count:', {
+    console.error('❌ Error decrementing token:', {
       error: error.message,
       code: error.code,
       statusCode: error.statusCode,
       userId: userId,
-      monthKey: monthKey,
       tableName: tableName,
       stack: error.stack,
     });
@@ -831,31 +858,62 @@ exports.handler = async (event) => {
       console.warn('Request headers:', JSON.stringify(event.headers || {}, null, 2));
     }
 
-    // Increment scan count and get updated count (await to include in response)
-    let scanCount = null;
+    // Check token balance before processing scan (only for authenticated users)
+    let tokenBalance = null;
     if (userId) {
-      console.log('=== Initiating Scan Count Increment ===');
+      console.log('=== Checking Token Balance ===');
       try {
-        const result = await incrementScanCount(userId);
-        if (result && result.count !== undefined) {
-          scanCount = result.count;
-          console.log('✅ Scan count incremented successfully. Total scans this month:', scanCount);
-        } else {
-          console.warn('⚠️ Scan count increment completed but count not returned');
+        tokenBalance = await getTokenBalance(userId);
+        console.log(`✅ Token balance retrieved: ${tokenBalance} tokens`);
+        
+        if (tokenBalance <= 0) {
+          console.warn('⚠️ User has insufficient tokens, blocking scan');
+          return {
+            statusCode: 402, // Payment Required
+            headers: {
+              'Content-Type': 'application/json',
+              'Access-Control-Allow-Origin': '*',
+            },
+            body: JSON.stringify({
+              success: false,
+              error: 'Insufficient tokens. Please purchase a scan pack to continue.',
+              tokenBalance: tokenBalance,
+              scansRemaining: tokenBalance,
+            }),
+          };
         }
       } catch (err) {
-        console.error('❌ Failed to increment scan count:', {
+        console.error('❌ Failed to check token balance:', {
           error: err.message,
           code: err.code,
-          statusCode: err.statusCode,
           userId: userId,
           stack: err.stack,
         });
-        // Continue even if scan count increment fails - don't block the response
+        // Continue with scan even if token check fails (graceful degradation)
+        // In production, you might want to block the scan here
       }
     } else {
-      console.warn('⚠️ User ID not found in request, skipping scan count increment');
+      console.warn('⚠️ User ID not found in request, skipping token check');
       console.warn('This might be a guest user or token extraction failed');
+    }
+
+    // Decrement token after successful scan (only for authenticated users with tokens)
+    if (userId && tokenBalance !== null && tokenBalance > 0) {
+      console.log('=== Decrementing Token After Successful Scan ===');
+      try {
+        const newBalance = await decrementToken(userId);
+        tokenBalance = newBalance;
+        console.log(`✅ Token decremented successfully. New balance: ${newBalance}`);
+      } catch (err) {
+        console.error('❌ Failed to decrement token:', {
+          error: err.message,
+          code: err.code,
+          userId: userId,
+          stack: err.stack,
+        });
+        // Continue even if token decrement fails - don't block the response
+        // The scan was already processed, so we'll log the error but not fail
+      }
     }
 
     // Save scan history synchronously (await before sending response)
@@ -890,7 +948,7 @@ exports.handler = async (event) => {
       console.warn('This might be a guest user or token extraction failed');
     }
 
-    // Prepare response with scan count and history save status
+    // Prepare response with token balance and history save status
     const response = {
       statusCode: 200,
       headers,
@@ -898,8 +956,11 @@ exports.handler = async (event) => {
         success: true,
         s3Url: s3Url,
         analysis: formalizedResponse,
-        // Include scan count if available
-        ...(scanCount !== null && { scanCount: scanCount }),
+        // Include token balance if available
+        ...(tokenBalance !== null && { 
+          tokenBalance: tokenBalance,
+          scansRemaining: tokenBalance,
+        }),
         // Include scan history save status
         scanHistorySaved: scanHistorySaved,
         // Optionally include request tracking info (remove in production if sensitive)

@@ -20,114 +20,100 @@ const dynamodb = new AWS.DynamoDB.DocumentClient();
 const cognito = new AWS.CognitoIdentityServiceProvider();
 
 // Configuration
-const SUBSCRIPTIONS_TABLE = process.env.SUBSCRIPTIONS_TABLE || 'image-analysis-dev-subscriptions';
-const SCAN_COUNTS_TABLE = process.env.SCAN_COUNTS_TABLE || 'image-analysis-dev-scan-counts';
+const TOKENS_TABLE = process.env.TOKENS_TABLE || 'image-analysis-dev-tokens';
 const USER_POOL_ID = process.env.COGNITO_USER_POOL_ID || '';
 
-// Constants
-const FREE_TIER_SCAN_LIMIT = 3;
-const MONTHS = ['01', '02', '03', '04', '05', '06', '07', '08', '09', '10', '11', '12'];
+// Legacy table names for backward compatibility (if needed)
+const SUBSCRIPTIONS_TABLE = process.env.SUBSCRIPTIONS_TABLE || 'image-analysis-dev-subscriptions';
+const SCAN_COUNTS_TABLE = process.env.SCAN_COUNTS_TABLE || 'image-analysis-dev-scan-counts';
+
+// Token pack configurations
+const TOKEN_PACKS = {
+  'pack_5': { tokens: 5, price: 4.99 },
+  'pack_20': { tokens: 20, price: 14.99 },
+  'pack_50': { tokens: 50, price: 29.99 },
+};
 
 /**
- * Get current month key (YYYY-MM format)
+ * Get token balance for a user
  */
-function getCurrentMonthKey() {
-  const now = new Date();
-  const year = now.getFullYear();
-  const month = MONTHS[now.getMonth()];
-  return `${year}-${month}`;
-}
-
-/**
- * Get subscription status for a user
- */
-async function getSubscriptionStatus(userId) {
+async function getTokenBalance(userId) {
   try {
     const result = await dynamodb.get({
-      TableName: SUBSCRIPTIONS_TABLE,
+      TableName: TOKENS_TABLE,
       Key: { userId: userId },
     }).promise();
 
     if (!result.Item) {
-      // No subscription record, default to free
-      return {
-        tier: 'free',
-        status: 'active',
-        isPro: false,
-      };
+      // No token record, default to 0
+      return 0;
     }
 
-    const subscription = result.Item;
-    const isPro = subscription.tier === 'pro' && 
-                  subscription.status === 'active' &&
-                  (!subscription.expiresAt || new Date(subscription.expiresAt) > new Date());
-
-    return {
-      tier: subscription.tier || 'free',
-      status: subscription.status || 'active',
-      isPro: isPro,
-      expiresAt: subscription.expiresAt,
-    };
+    return result.Item.balance || 0;
   } catch (error) {
-    console.error('Error getting subscription status:', error);
-    // Default to free tier on error
-    return {
-      tier: 'free',
-      status: 'active',
-      isPro: false,
-    };
-  }
-}
-
-/**
- * Get scan count for user in current month
- */
-async function getScanCount(userId) {
-  const monthKey = getCurrentMonthKey();
-  
-  try {
-    const result = await dynamodb.get({
-      TableName: SCAN_COUNTS_TABLE,
-      Key: {
-        userId: userId,
-        monthKey: monthKey,
-      },
-    }).promise();
-
-    return result.Item ? result.Item.count || 0 : 0;
-  } catch (error) {
-    console.error('Error getting scan count:', error);
+    console.error('Error getting token balance:', error);
     return 0;
   }
 }
 
 /**
- * Increment scan count for user
+ * Decrement token balance by 1 (used when a scan is performed)
  */
-async function incrementScanCount(userId) {
-  const monthKey = getCurrentMonthKey();
-  
+async function decrementToken(userId) {
   try {
-    await dynamodb.update({
-      TableName: SCAN_COUNTS_TABLE,
-      Key: {
-        userId: userId,
-        monthKey: monthKey,
-      },
-      UpdateExpression: 'SET #count = if_not_exists(#count, :zero) + :inc, #updatedAt = :now',
+    const result = await dynamodb.update({
+      TableName: TOKENS_TABLE,
+      Key: { userId: userId },
+      UpdateExpression: 'SET #balance = if_not_exists(#balance, :zero) - :dec, #updatedAt = :now',
+      ConditionExpression: '#balance > :zero',
       ExpressionAttributeNames: {
-        '#count': 'count',
+        '#balance': 'balance',
         '#updatedAt': 'updatedAt',
       },
       ExpressionAttributeValues: {
         ':zero': 0,
-        ':inc': 1,
+        ':dec': 1,
         ':now': new Date().toISOString(),
       },
+      ReturnValues: 'ALL_NEW',
     }).promise();
+
+    return result.Attributes.balance;
   } catch (error) {
-    console.error('Error incrementing scan count:', error);
-    // Non-fatal, log but continue
+    if (error.code === 'ConditionalCheckFailedException') {
+      // User has 0 tokens
+      throw new Error('Insufficient tokens');
+    }
+    console.error('Error decrementing token:', error);
+    throw error;
+  }
+}
+
+/**
+ * Add tokens to user balance (used when purchasing a token pack)
+ */
+async function addTokens(userId, amount) {
+  try {
+    const result = await dynamodb.update({
+      TableName: TOKENS_TABLE,
+      Key: { userId: userId },
+      UpdateExpression: 'SET #balance = if_not_exists(#balance, :zero) + :amount, #updatedAt = :now',
+      ExpressionAttributeNames: {
+        '#balance': 'balance',
+        '#updatedAt': 'updatedAt',
+      },
+      ExpressionAttributeValues: {
+        ':zero': 0,
+        ':amount': amount,
+        ':now': new Date().toISOString(),
+      },
+      ReturnValues: 'ALL_NEW',
+    }).promise();
+
+    return result.Attributes.balance;
+  } catch (error) {
+    console.error('Error adding tokens:', error);
+    throw error;
   }
 }
 
@@ -135,30 +121,14 @@ async function incrementScanCount(userId) {
  * Check if user can perform a scan
  */
 async function canUserScan(userId) {
-  const subscription = await getSubscriptionStatus(userId);
-  
-  // Pro users have unlimited scans
-  if (subscription.isPro) {
-    return {
-      canScan: true,
-      reason: 'pro_subscription',
-      scansRemaining: Infinity,
-      scanLimit: Infinity,
-    };
-  }
-
-  // Free users have limited scans
-  const scanCount = await getScanCount(userId);
-  const scansRemaining = Math.max(0, FREE_TIER_SCAN_LIMIT - scanCount);
-  const canScan = scansRemaining > 0;
+  const tokenBalance = await getTokenBalance(userId);
+  const canScan = tokenBalance > 0;
 
   return {
     canScan: canScan,
-    reason: canScan ? 'free_tier_available' : 'free_tier_limit_reached',
-    scansRemaining: scansRemaining,
-    scanCount: scanCount,
-    scanLimit: FREE_TIER_SCAN_LIMIT,
-    subscription: subscription,
+    reason: canScan ? 'tokens_available' : 'no_tokens',
+    scansRemaining: tokenBalance,
+    tokenBalance: tokenBalance,
   };
 }
 
@@ -225,22 +195,25 @@ exports.handler = async (event) => {
     const path = event.path || '';
     const method = event.httpMethod || 'GET';
 
-    // GET /subscription/status - Get subscription status
+    // GET /subscription/status - Get token balance (maintained for backward compatibility)
     if ((method === 'GET' && path.includes('/status')) || method === 'GET') {
-      const subscription = await getSubscriptionStatus(userId);
-      const scanCount = await getScanCount(userId);
-      const scanLimit = subscription.isPro ? Infinity : FREE_TIER_SCAN_LIMIT;
-      const scansRemaining = subscription.isPro ? Infinity : Math.max(0, scanLimit - scanCount);
+      const tokenBalance = await getTokenBalance(userId);
 
       return {
         statusCode: 200,
         headers,
         body: JSON.stringify({
           success: true,
-          subscription: subscription,
-          scanCount: scanCount,
-          scanLimit: scanLimit,
-          scansRemaining: scansRemaining,
+          tokenBalance: tokenBalance,
+          scansRemaining: tokenBalance,
+          // Legacy fields for backward compatibility
+          subscription: {
+            tier: 'token',
+            status: 'active',
+            isPro: false,
+          },
+          scanCount: 0,
+          scanLimit: Infinity,
         }),
       };
     }
@@ -259,29 +232,147 @@ exports.handler = async (event) => {
       };
     }
 
-    // POST /subscription/increment - Increment scan count (called after successful scan)
-    if (method === 'POST' && path.includes('/increment')) {
-      const subscription = await getSubscriptionStatus(userId);
-      
-      // Only increment for free users (pro users are unlimited)
-      if (!subscription.isPro) {
-        await incrementScanCount(userId);
+    // POST /subscription/decrement - Decrement token (called after successful scan)
+    if (method === 'POST' && path.includes('/decrement')) {
+      try {
+        const newBalance = await decrementToken(userId);
+
+        return {
+          statusCode: 200,
+          headers,
+          body: JSON.stringify({
+            success: true,
+            message: 'Token decremented',
+            tokenBalance: newBalance,
+            scansRemaining: newBalance,
+          }),
+        };
+      } catch (error) {
+        if (error.message === 'Insufficient tokens') {
+          return {
+            statusCode: 400,
+            headers,
+            body: JSON.stringify({
+              success: false,
+              error: 'Insufficient tokens',
+              tokenBalance: await getTokenBalance(userId),
+              scansRemaining: await getTokenBalance(userId),
+            }),
+          };
+        }
+        throw error;
+      }
+    }
+
+    // POST /subscription/purchase - Add tokens after purchase
+    if (method === 'POST' && path.includes('/purchase')) {
+      const body = typeof event.body === 'string' ? JSON.parse(event.body || '{}') : (event.body || {});
+      const { packId, transactionId } = body;
+
+      if (!packId || !TOKEN_PACKS[packId]) {
+        return {
+          statusCode: 400,
+          headers,
+          body: JSON.stringify({
+            success: false,
+            error: 'Invalid pack ID',
+          }),
+        };
       }
 
-      const scanCount = await getScanCount(userId);
-      const scanLimit = FREE_TIER_SCAN_LIMIT;
-      const scansRemaining = Math.max(0, scanLimit - scanCount);
+      try {
+        const pack = TOKEN_PACKS[packId];
+        const newBalance = await addTokens(userId, pack.tokens);
 
-      return {
-        statusCode: 200,
-        headers,
-        body: JSON.stringify({
-          success: true,
-          message: 'Scan count incremented',
-          scanCount: subscription.isPro ? 0 : scanCount,
-          scansRemaining: subscription.isPro ? Infinity : scansRemaining,
-        }),
-      };
+        // Log the purchase (optional - you might want to store this in a separate table)
+        console.log(`Token purchase: userId=${userId}, packId=${packId}, tokens=${pack.tokens}, transactionId=${transactionId || 'N/A'}`);
+
+        return {
+          statusCode: 200,
+          headers,
+          body: JSON.stringify({
+            success: true,
+            message: 'Tokens added successfully',
+            tokenBalance: newBalance,
+            scansRemaining: newBalance,
+            packPurchased: packId,
+            tokensAdded: pack.tokens,
+          }),
+        };
+      } catch (error) {
+        console.error('Error adding tokens:', error);
+        return {
+          statusCode: 500,
+          headers,
+          body: JSON.stringify({
+            success: false,
+            error: error.message,
+          }),
+        };
+      }
+    }
+
+    // POST /subscription/test/add-tokens - TEST ENDPOINT: Manually add tokens for testing
+    // This endpoint allows you to add any number of tokens for testing purposes
+    // Usage: POST /subscription/test/add-tokens with body: { userId: "...", tokens: 10 }
+    if (method === 'POST' && path.includes('/test/add-tokens')) {
+      const body = typeof event.body === 'string' ? JSON.parse(event.body || '{}') : (event.body || {});
+      const { tokens: tokensToAdd } = body;
+      
+      // Allow userId to be passed in body for testing (or use extracted userId)
+      const testUserId = body.userId || userId;
+
+      if (!testUserId) {
+        return {
+          statusCode: 400,
+          headers,
+          body: JSON.stringify({
+            success: false,
+            error: 'User ID is required. Provide userId in request body or Authorization header.',
+          }),
+        };
+      }
+
+      if (!tokensToAdd || typeof tokensToAdd !== 'number' || tokensToAdd <= 0) {
+        return {
+          statusCode: 400,
+          headers,
+          body: JSON.stringify({
+            success: false,
+            error: 'Invalid tokens amount. Must be a positive number.',
+          }),
+        };
+      }
+
+      try {
+        const newBalance = await addTokens(testUserId, tokensToAdd);
+
+        console.log(`[TEST] Manual token addition: userId=${testUserId}, tokens=${tokensToAdd}, newBalance=${newBalance}`);
+
+        return {
+          statusCode: 200,
+          headers,
+          body: JSON.stringify({
+            success: true,
+            message: `Successfully added ${tokensToAdd} tokens for testing`,
+            tokenBalance: newBalance,
+            scansRemaining: newBalance,
+            tokensAdded: tokensToAdd,
+            userId: testUserId,
+            note: 'This is a test endpoint for development purposes',
+          }),
+        };
+      } catch (error) {
+        console.error('Error adding test tokens:', error);
+        return {
+          statusCode: 500,
+          headers,
+          body: JSON.stringify({
+            success: false,
+            error: error.message,
+          }),
+        };
+      }
     }
 
     return {

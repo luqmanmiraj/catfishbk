@@ -11,7 +11,7 @@ provider:
   stage: ${opt:stage, 'dev'}
   profile: ${opt:aws-profile, env:AWS_PROFILE, 'default'}
   deploymentBucket:
-    name: ${self:service}-${self:provider.stage}-deployment-${self:provider.region}
+    name: ${self:service}-${self:provider.stage}-deployment-${self:provider.region}${env:DEPLOYMENT_BUCKET_SUFFIX, ''}
   memorySize: 512
   timeout: 29
   environment:
@@ -29,16 +29,22 @@ provider:
     # Cognito configuration
     COGNITO_USER_POOL_ID: !Ref CognitoUserPool
     COGNITO_USER_POOL_CLIENT_ID: !Ref CognitoUserPoolClient
-    COGNITO_USER_POOL_DOMAIN: ${self:service}-${self:provider.stage}
+    COGNITO_USER_POOL_DOMAIN: ${self:service}-${self:provider.stage}${env:COGNITO_DOMAIN_SUFFIX, ''}
     # RevenueCat configuration
     REVENUECAT_SECRET_KEY: ${env:REVENUECAT_SECRET_KEY, ''}
     REVENUECAT_SECRET_NAME: ${env:REVENUECAT_SECRET_NAME, 'catfish/revenuecat-secret-key'}
     # Gowinston configuration
     GOWINSTON_TOKEN: ${env:GOWINSTON_TOKEN, ''}
+    GOWINSTON_THRESHOLD_AUTHENTIC: ${env:GOWINSTON_THRESHOLD_AUTHENTIC, '20'}
+    GOWINSTON_THRESHOLD_DEEPFAKE: ${env:GOWINSTON_THRESHOLD_DEEPFAKE, '80'}
+    # Service configuration
+    SERVICE_NAME: ${self:service}
+    STAGE: ${self:provider.stage}
     # DynamoDB table names
     SUBSCRIPTIONS_TABLE: ${self:service}-${self:provider.stage}-subscriptions
     SCAN_COUNTS_TABLE: ${self:service}-${self:provider.stage}-scan-counts
     SCAN_HISTORY_TABLE: ${self:service}-${self:provider.stage}-scan-history
+    TOKENS_TABLE: ${self:service}-${self:provider.stage}-tokens
   iam:
     role:
       statements:
@@ -92,6 +98,7 @@ provider:
             - !Sub 'arn:aws:dynamodb:${self:provider.region}:*:table/${self:service}-${self:provider.stage}-subscriptions'
             - !Sub 'arn:aws:dynamodb:${self:provider.region}:*:table/${self:service}-${self:provider.stage}-scan-counts'
             - !Sub 'arn:aws:dynamodb:${self:provider.region}:*:table/${self:service}-${self:provider.stage}-scan-history'
+            - !Sub 'arn:aws:dynamodb:${self:provider.region}:*:table/${self:service}-${self:provider.stage}-tokens'
             - !Sub 'arn:aws:dynamodb:${self:provider.region}:*:table/${self:service}-${self:provider.stage}-scan-history/index/*'
         - Effect: Allow
           Action:
@@ -186,6 +193,18 @@ functions:
           cors: true
       - http:
           path: subscription/increment
+          method: post
+          cors: true
+      - http:
+          path: subscription/decrement
+          method: post
+          cors: true
+      - http:
+          path: subscription/purchase
+          method: post
+          cors: true
+      - http:
+          path: subscription/test/add-tokens
           method: post
           cors: true
   scanHistory:
@@ -322,7 +341,7 @@ resources:
     CognitoUserPoolDomain:
       Type: AWS::Cognito::UserPoolDomain
       Properties:
-        Domain: ${self:service}-${self:provider.stage}
+        Domain: ${self:service}-${self:provider.stage}${env:COGNITO_DOMAIN_SUFFIX, ''}
         UserPoolId: !Ref CognitoUserPool
     # Cognito User Pool Client with Passkey and Email authentication flows
     CognitoUserPoolClient:
@@ -404,6 +423,18 @@ resources:
         TimeToLiveSpecification:
           Enabled: true
           AttributeName: expiresAt
+    # Tokens DynamoDB Table (stores token balance per user)
+    TokensTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:service}-${self:provider.stage}-tokens
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: userId
+            AttributeType: S
+        KeySchema:
+          - AttributeName: userId
+            KeyType: HASH
   Outputs:
     CognitoUserPoolId:
       Description: Cognito User Pool ID
@@ -422,7 +453,7 @@ resources:
         Name: ${self:service}-${self:provider.stage}-user-pool-client-id
     CognitoUserPoolDomain:
       Description: Cognito User Pool Domain
-      Value: ${self:service}-${self:provider.stage}
+      Value: ${self:service}-${self:provider.stage}${env:COGNITO_DOMAIN_SUFFIX, ''}
       Export:
         Name: ${self:service}-${self:provider.stage}-user-pool-domain
     CognitoAuthUrl:
