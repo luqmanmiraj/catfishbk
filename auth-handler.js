@@ -18,10 +18,14 @@ if (!isLambda && process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_
 AWS.config.update(awsConfig);
 
 const cognitoIdentityServiceProvider = new AWS.CognitoIdentityServiceProvider();
+const dynamodb = new AWS.DynamoDB.DocumentClient();
 
 // Get Cognito configuration from environment variables
 const USER_POOL_ID = process.env.COGNITO_USER_POOL_ID;
 const CLIENT_ID = process.env.COGNITO_USER_POOL_CLIENT_ID;
+
+// Get tokens table name from environment variables
+const TOKENS_TABLE = process.env.TOKENS_TABLE || 'image-analysis-dev-tokens';
 
 /**
  * CORS headers
@@ -356,6 +360,37 @@ function generateRandomPassword() {
 }
 
 /**
+ * Add tokens to a user's balance (for new guest users)
+ */
+async function addTokensToUser(userId, amount) {
+  try {
+    const result = await dynamodb.update({
+      TableName: TOKENS_TABLE,
+      Key: { userId: userId },
+      UpdateExpression: 'SET #balance = if_not_exists(#balance, :zero) + :amount, #updatedAt = :now',
+      ExpressionAttributeNames: {
+        '#balance': 'balance',
+        '#updatedAt': 'updatedAt',
+      },
+      ExpressionAttributeValues: {
+        ':zero': 0,
+        ':amount': amount,
+        ':now': new Date().toISOString(),
+      },
+      ReturnValues: 'ALL_NEW',
+    }).promise();
+
+    console.log(`✅ Added ${amount} tokens to new guest user: ${userId}, new balance: ${result.Attributes.balance}`);
+    return result.Attributes.balance;
+  } catch (error) {
+    console.error('Error adding tokens to guest user:', error);
+    // Don't throw error - guest signup should still succeed even if token addition fails
+    // This is a non-critical operation
+    return null;
+  }
+}
+
+/**
  * Guest sign up - creates a temporary user account with device ID
  */
 async function guestSignUp(deviceId) {
@@ -476,6 +511,9 @@ async function guestSignUp(deviceId) {
       }
       userSub = createResult.User.Username;
       username = createResult.User.Username;
+      
+      // Add 5 free tokens for new guest users
+      await addTokensToUser(userSub, 5);
     }
 
     // Sign in the guest user
