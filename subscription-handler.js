@@ -2,6 +2,7 @@
 require('dotenv').config();
 
 const AWS = require('aws-sdk');
+const { v4: uuidv4 } = require('uuid');
 
 // Configure AWS SDK
 const awsConfig = {
@@ -21,6 +22,7 @@ const cognito = new AWS.CognitoIdentityServiceProvider();
 
 // Configuration
 const TOKENS_TABLE = process.env.TOKENS_TABLE || 'image-analysis-dev-tokens';
+const PURCHASES_TABLE = process.env.PURCHASES_TABLE || 'image-analysis-dev-purchases';
 const USER_POOL_ID = process.env.COGNITO_USER_POOL_ID || '';
 
 // Legacy table names for backward compatibility (if needed)
@@ -33,6 +35,40 @@ const TOKEN_PACKS = {
   'pack_20': { tokens: 20, price: 14.99 },
   'pack_50': { tokens: 50, price: 29.99 },
 };
+
+/**
+ * Save purchase record to DynamoDB
+ */
+async function savePurchase(userId, packId, tokens, price, transactionId) {
+  const purchaseId = `purchase-${Date.now()}-${uuidv4()}`;
+  const purchaseDate = new Date().toISOString();
+  
+  const purchaseItem = {
+    purchaseId: purchaseId,
+    userId: userId,
+    packId: packId,
+    tokens: tokens,
+    price: price,
+    transactionId: transactionId || null,
+    purchaseDate: purchaseDate,
+    status: 'completed',
+    createdAt: purchaseDate,
+  };
+  
+  try {
+    await dynamodb.put({
+      TableName: PURCHASES_TABLE,
+      Item: purchaseItem,
+    }).promise();
+    
+    console.log(`✅ Purchase saved: ${purchaseId} for user ${userId}`);
+    return purchaseItem;
+  } catch (error) {
+    console.error('Error saving purchase:', error);
+    // Don't throw - purchase should still succeed even if logging fails
+    return null;
+  }
+}
 
 /**
  * Get token balance for a user
@@ -284,8 +320,8 @@ exports.handler = async (event) => {
         const pack = TOKEN_PACKS[packId];
         const newBalance = await addTokens(userId, pack.tokens);
 
-        // Log the purchase (optional - you might want to store this in a separate table)
-        console.log(`Token purchase: userId=${userId}, packId=${packId}, tokens=${pack.tokens}, transactionId=${transactionId || 'N/A'}`);
+        // Save purchase record to DynamoDB
+        await savePurchase(userId, packId, pack.tokens, pack.price, transactionId);
 
         return {
           statusCode: 200,

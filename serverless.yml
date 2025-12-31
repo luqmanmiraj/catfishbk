@@ -45,6 +45,9 @@ provider:
     SCAN_COUNTS_TABLE: ${self:service}-${self:provider.stage}-scan-counts
     SCAN_HISTORY_TABLE: ${self:service}-${self:provider.stage}-scan-history
     TOKENS_TABLE: ${self:service}-${self:provider.stage}-tokens
+    PURCHASES_TABLE: ${self:service}-${self:provider.stage}-purchases
+    # Admin configuration
+    ADMIN_GROUP_NAME: ${env:ADMIN_GROUP_NAME, 'admin'}
   iam:
     role:
       statements:
@@ -92,6 +95,8 @@ provider:
             - dynamodb:UpdateItem
             - dynamodb:GetItem
             - dynamodb:Query
+            - dynamodb:Scan
+            - dynamodb:DeleteItem
           Resource:
             - !Sub 'arn:aws:dynamodb:${self:provider.region}:*:table/${self:service}-${self:provider.stage}-requests'
             - !Sub 'arn:aws:dynamodb:${self:provider.region}:*:table/${self:service}-${self:provider.stage}-requests/index/*'
@@ -99,7 +104,9 @@ provider:
             - !Sub 'arn:aws:dynamodb:${self:provider.region}:*:table/${self:service}-${self:provider.stage}-scan-counts'
             - !Sub 'arn:aws:dynamodb:${self:provider.region}:*:table/${self:service}-${self:provider.stage}-scan-history'
             - !Sub 'arn:aws:dynamodb:${self:provider.region}:*:table/${self:service}-${self:provider.stage}-tokens'
+            - !Sub 'arn:aws:dynamodb:${self:provider.region}:*:table/${self:service}-${self:provider.stage}-purchases'
             - !Sub 'arn:aws:dynamodb:${self:provider.region}:*:table/${self:service}-${self:provider.stage}-scan-history/index/*'
+            - !Sub 'arn:aws:dynamodb:${self:provider.region}:*:table/${self:service}-${self:provider.stage}-purchases/index/*'
         - Effect: Allow
           Action:
             - cognito-idp:AdminInitiateAuth
@@ -122,6 +129,14 @@ provider:
             - cognito-idp:ForgotPassword
             - cognito-idp:ConfirmForgotPassword
             - cognito-idp:GetUser
+            # Admin operations
+            - cognito-idp:AdminListGroupsForUser
+            - cognito-idp:AdminListUsers
+            - cognito-idp:AdminGetUser
+            - cognito-idp:AdminUpdateUserAttributes
+            - cognito-idp:AdminDeleteUser
+            - cognito-idp:AdminEnableUser
+            - cognito-idp:AdminDisableUser
           Resource:
             - !Sub 'arn:aws:cognito-idp:${self:provider.region}:*:userpool/*'
             - !GetAtt CognitoUserPool.Arn
@@ -220,6 +235,61 @@ functions:
       - http:
           path: gowinston/detect
           method: post
+          cors: true
+  admin:
+    handler: admin-handler.handler
+    events:
+      - http:
+          path: admin/auth/verify
+          method: post
+          cors: true
+      - http:
+          path: admin/users
+          method: get
+          cors: true
+      - http:
+          path: admin/users/{userId}
+          method: get
+          cors: true
+      - http:
+          path: admin/users/{userId}
+          method: put
+          cors: true
+      - http:
+          path: admin/users/{userId}
+          method: delete
+          cors: true
+      - http:
+          path: admin/users/{userId}/tokens
+          method: get
+          cors: true
+      - http:
+          path: admin/users/{userId}/tokens/add
+          method: post
+          cors: true
+      - http:
+          path: admin/users/{userId}/tokens/set
+          method: post
+          cors: true
+      - http:
+          path: admin/users/{userId}/scans
+          method: get
+          cors: true
+      - http:
+          path: admin/users/{userId}/purchases
+          method: get
+          cors: true
+      - http:
+          path: admin/analytics/dashboard
+          method: get
+          cors: true
+      - http:
+          path: admin/scans
+          method: get
+          cors: true
+      - http:
+          path: admin/purchases
+          method: get
           cors: true
 
 resources:
@@ -435,6 +505,31 @@ resources:
         KeySchema:
           - AttributeName: userId
             KeyType: HASH
+    # Purchases DynamoDB Table (stores purchase records)
+    PurchasesTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:service}-${self:provider.stage}-purchases
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: purchaseId
+            AttributeType: S
+          - AttributeName: userId
+            AttributeType: S
+          - AttributeName: purchaseDate
+            AttributeType: S
+        KeySchema:
+          - AttributeName: purchaseId
+            KeyType: HASH
+        GlobalSecondaryIndexes:
+          - IndexName: userId-purchaseDate-index
+            KeySchema:
+              - AttributeName: userId
+                KeyType: HASH
+              - AttributeName: purchaseDate
+                KeyType: RANGE
+            Projection:
+              ProjectionType: ALL
   Outputs:
     CognitoUserPoolId:
       Description: Cognito User Pool ID
