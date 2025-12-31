@@ -122,6 +122,77 @@ async function getScanHistory(userId, limit = 50, lastEvaluatedKey = null) {
 }
 
 /**
+ * Update scan history item (label and note)
+ */
+async function updateScanHistory(userId, scanId, updateData) {
+  if (!userId) {
+    throw new Error('User ID is required');
+  }
+  
+  if (!scanId) {
+    throw new Error('Scan ID is required');
+  }
+
+  // First, verify the scan belongs to the user
+  try {
+    const getParams = {
+      TableName: SCAN_HISTORY_TABLE,
+      Key: {
+        userId: userId,
+        scanId: scanId,
+      },
+    };
+    
+    const existingItem = await dynamodb.get(getParams).promise();
+    
+    if (!existingItem.Item) {
+      throw new Error('Scan not found or access denied');
+    }
+    
+    // Build update expression
+    const updateExpressions = [];
+    const expressionAttributeNames = {};
+    const expressionAttributeValues = {};
+    
+    if (updateData.label !== undefined) {
+      updateExpressions.push('#label = :label');
+      expressionAttributeNames['#label'] = 'label';
+      expressionAttributeValues[':label'] = updateData.label || null;
+    }
+    
+    if (updateData.note !== undefined) {
+      updateExpressions.push('#note = :note');
+      expressionAttributeNames['#note'] = 'note';
+      expressionAttributeValues[':note'] = updateData.note || null;
+    }
+    
+    if (updateExpressions.length === 0) {
+      throw new Error('No fields to update');
+    }
+    
+    const updateParams = {
+      TableName: SCAN_HISTORY_TABLE,
+      Key: {
+        userId: userId,
+        scanId: scanId,
+      },
+      UpdateExpression: `SET ${updateExpressions.join(', ')}`,
+      ExpressionAttributeNames: expressionAttributeNames,
+      ExpressionAttributeValues: expressionAttributeValues,
+      ReturnValues: 'ALL_NEW',
+    };
+    
+    const result = await dynamodb.update(updateParams).promise();
+    
+    console.log(`✅ Scan history updated successfully for user: ${userId}, scan: ${scanId}`);
+    return result.Attributes;
+  } catch (error) {
+    console.error('Error updating scan history:', error);
+    throw error;
+  }
+}
+
+/**
  * Lambda handler
  */
 exports.handler = async (event) => {
@@ -131,7 +202,7 @@ exports.handler = async (event) => {
     'Content-Type': 'application/json',
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Headers': 'Content-Type,Authorization',
-    'Access-Control-Allow-Methods': 'GET,OPTIONS',
+    'Access-Control-Allow-Methods': 'GET,PATCH,PUT,OPTIONS',
   };
 
   // Handle preflight OPTIONS request
@@ -158,37 +229,126 @@ exports.handler = async (event) => {
       };
     }
 
-    // Get query parameters
-    const queryParams = event.queryStringParameters || {};
-    const limit = parseInt(queryParams.limit || '50', 10);
-    const lastEvaluatedKey = queryParams.lastEvaluatedKey 
-      ? JSON.parse(decodeURIComponent(queryParams.lastEvaluatedKey))
-      : null;
-
-    // Validate limit
-    if (limit < 1 || limit > 100) {
+    // Handle PATCH/PUT requests for updating scan history
+    if (event.httpMethod === 'PATCH' || event.httpMethod === 'PUT') {
+      // Extract scanId from path parameters or body
+      let scanId = null;
+      let updateData = {};
+      
+      // Try to get scanId from path parameters (e.g., /scan-history/{scanId})
+      if (event.pathParameters && event.pathParameters.scanId) {
+        scanId = event.pathParameters.scanId;
+      }
+      
+      // Parse request body
+      let body = {};
+      if (event.body) {
+        try {
+          body = typeof event.body === 'string' ? JSON.parse(event.body) : event.body;
+        } catch (e) {
+          return {
+            statusCode: 400,
+            headers,
+            body: JSON.stringify({
+              success: false,
+              error: 'Invalid request body',
+            }),
+          };
+        }
+      }
+      
+      // Get scanId from body if not in path
+      if (!scanId && body.scanId) {
+        scanId = body.scanId;
+      }
+      
+      if (!scanId) {
+        return {
+          statusCode: 400,
+          headers,
+          body: JSON.stringify({
+            success: false,
+            error: 'Scan ID is required',
+          }),
+        };
+      }
+      
+      // Extract label and note from body
+      if (body.label !== undefined) {
+        updateData.label = body.label;
+      }
+      if (body.note !== undefined) {
+        updateData.note = body.note;
+      }
+      
+      if (Object.keys(updateData).length === 0) {
+        return {
+          statusCode: 400,
+          headers,
+          body: JSON.stringify({
+            success: false,
+            error: 'No fields to update. Provide label and/or note.',
+          }),
+        };
+      }
+      
+      // Update scan history
+      const updatedScan = await updateScanHistory(userId, scanId, updateData);
+      
       return {
-        statusCode: 400,
+        statusCode: 200,
         headers,
         body: JSON.stringify({
-          success: false,
-          error: 'Invalid limit. Limit must be between 1 and 100.',
+          success: true,
+          scan: updatedScan,
         }),
       };
     }
 
-    // Get scan history
-    const history = await getScanHistory(userId, limit, lastEvaluatedKey);
+    // Handle GET requests for retrieving scan history
+    if (event.httpMethod === 'GET') {
+      // Get query parameters
+      const queryParams = event.queryStringParameters || {};
+      const limit = parseInt(queryParams.limit || '50', 10);
+      const lastEvaluatedKey = queryParams.lastEvaluatedKey 
+        ? JSON.parse(decodeURIComponent(queryParams.lastEvaluatedKey))
+        : null;
 
+      // Validate limit
+      if (limit < 1 || limit > 100) {
+        return {
+          statusCode: 400,
+          headers,
+          body: JSON.stringify({
+            success: false,
+            error: 'Invalid limit. Limit must be between 1 and 100.',
+          }),
+        };
+      }
+
+      // Get scan history
+      const history = await getScanHistory(userId, limit, lastEvaluatedKey);
+
+      return {
+        statusCode: 200,
+        headers,
+        body: JSON.stringify({
+          success: true,
+          scans: history.items,
+          count: history.count,
+          hasMore: !!history.lastEvaluatedKey,
+          lastEvaluatedKey: history.lastEvaluatedKey,
+        }),
+      };
+    }
+
+    // Method not allowed
     return {
-      statusCode: 200,
+      statusCode: 405,
       headers,
       body: JSON.stringify({
-        success: true,
-        scans: history.items,
-        count: history.count,
-        hasMore: !!history.lastEvaluatedKey,
-        lastEvaluatedKey: history.lastEvaluatedKey,
+        success: false,
+        error: 'Method not allowed',
       }),
     };
   } catch (error) {

@@ -229,6 +229,14 @@ functions:
           path: scan-history
           method: get
           cors: true
+      - http:
+          path: scan-history
+          method: patch
+          cors: true
+      - http:
+          path: scan-history/{scanId}
+          method: patch
+          cors: true
   gowinston:
     handler: gowinston-handler.handler
     events:

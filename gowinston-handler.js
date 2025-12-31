@@ -430,6 +430,8 @@ async function saveScanHistory(userId, scanData) {
     s3Url: scanData.s3Url || null,
     requestId: scanData.requestId || null,
     source: 'gowinston',
+    label: scanData.label || null,
+    note: scanData.note || null,
     createdAt: new Date().toISOString(),
     expiresAt: expiresAt,
   };

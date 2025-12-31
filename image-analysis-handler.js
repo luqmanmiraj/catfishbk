@@ -498,6 +498,8 @@ async function saveScanHistory(userId, scanData) {
     sightengineRequestId: scanData.sightengineRequestId || null,
     s3Url: scanData.s3Url || null,
     requestId: scanData.requestId || null,
+    label: scanData.label || null,
+    note: scanData.note || null,
     createdAt: new Date().toISOString(),
     expiresAt: expiresAt, // TTL for automatic cleanup
   };
