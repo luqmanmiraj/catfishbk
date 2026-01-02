@@ -2,6 +2,7 @@
 require('dotenv').config();
 
 const AWS = require('aws-sdk');
+const { v4: uuidv4 } = require('uuid');
 
 // Configure AWS SDK
 const awsConfig = {
@@ -20,6 +21,16 @@ const dynamodb = new AWS.DynamoDB.DocumentClient();
 
 // Configuration
 const SCAN_HISTORY_TABLE = process.env.SCAN_HISTORY_TABLE || 'image-analysis-dev-scan-history';
+
+/**
+ * Get current month key for partitioning (YYYY-MM format)
+ */
+function getCurrentMonthKey() {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, '0');
+  return `${year}-${month}`;
+}
 
 /**
  * Extract token from request headers
@@ -110,13 +121,104 @@ async function getScanHistory(userId, limit = 50, lastEvaluatedKey = null) {
 
   try {
     const result = await dynamodb.query(params).promise();
+    
+    // Sort by timestamp (newest first) since scanId is deterministic and doesn't reflect creation time
+    const items = (result.Items || []).sort((a, b) => {
+      const timeA = new Date(a.timestamp || a.createdAt || 0).getTime();
+      const timeB = new Date(b.timestamp || b.createdAt || 0).getTime();
+      return timeB - timeA; // Descending order (newest first)
+    });
+    
     return {
-      items: result.Items || [],
+      items: items,
       lastEvaluatedKey: result.LastEvaluatedKey || null,
       count: result.Count || 0,
     };
   } catch (error) {
     console.error('Error getting scan history:', error);
+    throw error;
+  }
+}
+
+/**
+ * Create new scan history entry
+ */
+async function createScanHistory(userId, scanData) {
+  if (!userId) {
+    throw new Error('User ID is required');
+  }
+
+  const monthKey = getCurrentMonthKey();
+  
+  // Generate deterministic scanId based on s3Url (if available) to prevent duplicates
+  let scanId;
+  if (scanData.s3Url) {
+    // Extract hash from s3Url (format: images/{hash}.{ext})
+    const s3Hash = scanData.s3Url.match(/images\/([^\.]+)/)?.[1] || null;
+    if (s3Hash) {
+      scanId = `${userId}-${s3Hash}`;
+    } else {
+      scanId = `${Date.now()}-${uuidv4()}`;
+    }
+  } else if (scanData.requestId) {
+    // Use requestId to make it somewhat deterministic
+    scanId = `${userId}-${scanData.requestId}`;
+  } else {
+    scanId = `${Date.now()}-${uuidv4()}`;
+  }
+  
+  const expiresAt = Math.floor(Date.now() / 1000) + (365 * 24 * 60 * 60);
+  
+  const historyItem = {
+    userId: userId,
+    scanId: scanId,
+    monthKey: monthKey,
+    timestamp: new Date().toISOString(),
+    success: scanData.success !== undefined ? scanData.success : true,
+    status: scanData.status || 'unknown',
+    deepfakeScore: scanData.deepfakeScore || null,
+    aiProbability: scanData.aiProbability || null,
+    humanProbability: scanData.humanProbability || null,
+    sightengineRequestId: scanData.sightengineRequestId || null,
+    gowinstonRequestId: scanData.gowinstonRequestId || null,
+    s3Url: scanData.s3Url || null,
+    requestId: scanData.requestId || null,
+    source: scanData.source || 'image-analysis',
+    label: scanData.label || null,
+    note: scanData.note || null,
+    createdAt: new Date().toISOString(),
+    expiresAt: expiresAt,
+  };
+  
+  try {
+    // Use conditional put to prevent duplicates atomically
+    await dynamodb.put({
+      TableName: SCAN_HISTORY_TABLE,
+      Item: historyItem,
+      ConditionExpression: 'attribute_not_exists(userId) AND attribute_not_exists(scanId)',
+    }).promise();
+    
+    console.log(`✅ Scan history created successfully for user: ${userId}, scan: ${scanId}`);
+    return historyItem;
+  } catch (error) {
+    // If conditional put fails due to item already existing, return existing item
+    if (error.code === 'ConditionalCheckFailedException') {
+      console.log(`⚠️ Scan with scanId ${scanId} already exists for user ${userId}. Returning existing item.`);
+      try {
+        const existing = await dynamodb.get({
+          TableName: SCAN_HISTORY_TABLE,
+          Key: { userId: userId, scanId: scanId },
+        }).promise();
+        if (existing.Item) {
+          return existing.Item;
+        }
+      } catch (getError) {
+        console.warn('Could not retrieve existing scan:', getError.message);
+      }
+      return historyItem; // Return the item we tried to save
+    }
+    
+    console.error('❌ Error creating scan history:', error);
     throw error;
   }
 }
@@ -202,7 +304,7 @@ exports.handler = async (event) => {
     'Content-Type': 'application/json',
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Headers': 'Content-Type,Authorization',
-    'Access-Control-Allow-Methods': 'GET,PATCH,PUT,OPTIONS',
+    'Access-Control-Allow-Methods': 'GET,POST,PATCH,PUT,OPTIONS',
   };
 
   // Handle preflight OPTIONS request
@@ -225,6 +327,76 @@ exports.handler = async (event) => {
         body: JSON.stringify({
           success: false,
           error: 'Unauthorized: User ID is required. Please provide a valid authentication token.',
+        }),
+      };
+    }
+
+    // Handle POST requests for creating new scan history entries
+    if (event.httpMethod === 'POST') {
+      // Parse request body
+      let body = {};
+      if (event.body) {
+        try {
+          body = typeof event.body === 'string' ? JSON.parse(event.body) : event.body;
+        } catch (e) {
+          return {
+            statusCode: 400,
+            headers,
+            body: JSON.stringify({
+              success: false,
+              error: 'Invalid request body',
+            }),
+          };
+        }
+      }
+      
+      // Validate required fields
+      if (!body.s3Url && !body.requestId) {
+        return {
+          statusCode: 400,
+          headers,
+          body: JSON.stringify({
+            success: false,
+            error: 'Either s3Url or requestId is required',
+          }),
+        };
+      }
+      
+      if (!body.status) {
+        return {
+          statusCode: 400,
+          headers,
+          body: JSON.stringify({
+            success: false,
+            error: 'Status is required',
+          }),
+        };
+      }
+      
+      // Create scan history entry
+      const scanData = {
+        success: body.success !== undefined ? body.success : true,
+        status: body.status,
+        deepfakeScore: body.deepfakeScore || null,
+        aiProbability: body.aiProbability || null,
+        humanProbability: body.humanProbability || null,
+        sightengineRequestId: body.sightengineRequestId || null,
+        gowinstonRequestId: body.gowinstonRequestId || null,
+        s3Url: body.s3Url || null,
+        requestId: body.requestId || null,
+        source: body.source || 'image-analysis',
+        label: body.label || null,
+        note: body.note || null,
+      };
+      
+      const newScan = await createScanHistory(userId, scanData);
+      
+      return {
+        statusCode: 201,
+        headers,
+        body: JSON.stringify({
+          success: true,
+          scan: newScan,
         }),
       };
     }

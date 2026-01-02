@@ -231,6 +231,10 @@ functions:
           cors: true
       - http:
           path: scan-history
+          method: post
+          cors: true
+      - http:
+          path: scan-history
           method: patch
           cors: true
       - http:

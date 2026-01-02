@@ -17,14 +17,22 @@ if [ -f .env ]; then
     echo ""
 fi
 
-# Check if serverless is installed
-if ! command -v serverless &> /dev/null; then
-    echo "❌ Serverless Framework is not installed."
-    echo "   Install it with: npm install -g serverless"
+# Check if serverless is installed (globally or locally via npx)
+if ! command -v serverless &> /dev/null && ! command -v npx &> /dev/null; then
+    echo "❌ Serverless Framework is not installed and npx is not available."
+    echo "   Install it locally with: npm install"
+    echo "   Or install globally with: npm install -g serverless"
     exit 1
 fi
 
-echo "✅ Serverless Framework found"
+# Use npx if serverless is not in PATH (local installation)
+if ! command -v serverless &> /dev/null; then
+    SERVERLESS_CMD="npx serverless"
+    echo "✅ Using locally installed Serverless Framework (via npx)"
+else
+    SERVERLESS_CMD="serverless"
+    echo "✅ Serverless Framework found"
+fi
 
 # Check if AWS CLI is configured
 if ! command -v aws &> /dev/null; then
@@ -92,7 +100,7 @@ npm install
 # Deploy
 echo ""
 echo "🚀 Deploying Lambda function..."
-serverless deploy
+$SERVERLESS_CMD deploy
 
 echo ""
 echo "✅ Deployment complete!"

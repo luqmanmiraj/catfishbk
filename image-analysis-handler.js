@@ -3,6 +3,7 @@ require('dotenv').config();
 
 const AWS = require('aws-sdk');
 const https = require('https');
+const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
 const axios = require('axios');
 const FormData = require('form-data');
@@ -127,22 +128,36 @@ async function initializeConfig() {
 /**
  * Upload image to S3 and return the public URL
  */
-async function uploadToS3(imageBuffer, contentType, extension, bucketName) {
-  const key = `images/${uuidv4()}.${extension}`;
+async function uploadToS3(imageBuffer, contentType, extension, bucketName, requestId = null) {
+  // Generate deterministic key based on image hash to prevent duplicate uploads
+  // If same image is uploaded multiple times, it will use the same S3 key
+  const imageHash = crypto.createHash('sha256').update(imageBuffer).digest('hex');
+  const key = `images/${imageHash.substring(0, 16)}.${extension}`;
   
-  const params = {
-    Bucket: bucketName,
-    Key: key,
-    Body: imageBuffer,
-    ContentType: contentType,
-    // ACL removed - bucket policy handles public access
-    // Modern S3 buckets often have ACLs disabled for security
-    CacheControl: 'max-age=3600', // Cache for 1 hour
-  };
+  // Check if object already exists in S3 (idempotent upload)
+  try {
+    await s3.headObject({ Bucket: bucketName, Key: key }).promise();
+    console.log(`Image already exists in S3 with key: ${key}, skipping upload`);
+  } catch (error) {
+    if (error.code === 'NotFound') {
+      // Object doesn't exist, upload it
+      const params = {
+        Bucket: bucketName,
+        Key: key,
+        Body: imageBuffer,
+        ContentType: contentType,
+        // ACL removed - bucket policy handles public access
+        // Modern S3 buckets often have ACLs disabled for security
+        CacheControl: 'max-age=3600', // Cache for 1 hour
+      };
 
-  console.log(`Uploading to S3: bucket=${bucketName}, key=${key}, size=${(imageBuffer.length / 1024).toFixed(2)}KB`);
-  await s3.putObject(params).promise();
-  console.log('S3 upload completed');
+      console.log(`Uploading to S3: bucket=${bucketName}, key=${key}, size=${(imageBuffer.length / 1024).toFixed(2)}KB`);
+      await s3.putObject(params).promise();
+      console.log('S3 upload completed');
+    } else {
+      throw error;
+    }
+  }
   
   // Return the public URL using regional endpoint format
   const region = AWS.config.region || 'us-east-1';
@@ -469,7 +484,58 @@ function getCurrentMonthKey() {
 }
 
 /**
+ * Check if scan history already exists for a given s3Url or requestId
+ * Uses s3Url as primary check (unique per image), falls back to requestId
+ */
+async function checkExistingScan(userId, s3Url, requestId, tableName) {
+  if (!s3Url && !requestId) {
+    return null;
+  }
+  
+  try {
+    // First try to find by s3Url (most reliable - each image gets unique S3 URL)
+    if (s3Url) {
+      const scanResult = await dynamodb.scan({
+        TableName: tableName,
+        FilterExpression: 'userId = :userId AND s3Url = :s3Url',
+        ExpressionAttributeValues: {
+          ':userId': userId,
+          ':s3Url': s3Url,
+        },
+        Limit: 1,
+      }).promise();
+      
+      if (scanResult.Items && scanResult.Items.length > 0) {
+        return scanResult.Items[0];
+      }
+    }
+    
+    // Fallback: check by requestId if s3Url not available
+    if (requestId) {
+      const scanResult = await dynamodb.scan({
+        TableName: tableName,
+        FilterExpression: 'userId = :userId AND requestId = :requestId',
+        ExpressionAttributeValues: {
+          ':userId': userId,
+          ':requestId': requestId,
+        },
+        Limit: 1,
+      }).promise();
+      
+      if (scanResult.Items && scanResult.Items.length > 0) {
+        return scanResult.Items[0];
+      }
+    }
+  } catch (error) {
+    console.warn('Error checking for existing scan:', error.message);
+  }
+  
+  return null;
+}
+
+/**
  * Save scan history to DynamoDB
+ * Prevents duplicates by checking for existing scan with same requestId
  */
 async function saveScanHistory(userId, scanData) {
   if (!userId) {
@@ -481,8 +547,24 @@ async function saveScanHistory(userId, scanData) {
   const tableName = process.env.SCAN_HISTORY_TABLE || 
                     `${process.env.SERVICE_NAME || 'image-analysis'}-${process.env.STAGE || 'dev'}-scan-history`;
   
-  // Generate unique scan ID (timestamp + random UUID for uniqueness)
-  const scanId = `${Date.now()}-${uuidv4()}`;
+  // Generate deterministic scanId based on s3Url (if available) to prevent duplicates
+  // If s3Url exists, use it to create a deterministic scanId
+  // Otherwise, use requestId + timestamp
+  let scanId;
+  if (scanData.s3Url) {
+    // Extract hash from s3Url (format: images/{hash}.{ext})
+    const s3Hash = scanData.s3Url.match(/images\/([^\.]+)/)?.[1] || null;
+    if (s3Hash) {
+      scanId = `${userId}-${s3Hash}`;
+    } else {
+      scanId = `${Date.now()}-${uuidv4()}`;
+    }
+  } else if (scanData.requestId) {
+    // Use requestId to make it somewhat deterministic
+    scanId = `${userId}-${scanData.requestId}`;
+  } else {
+    scanId = `${Date.now()}-${uuidv4()}`;
+  }
   
   // Calculate TTL (expires after 1 year)
   const expiresAt = Math.floor(Date.now() / 1000) + (365 * 24 * 60 * 60);
@@ -504,17 +586,38 @@ async function saveScanHistory(userId, scanData) {
     expiresAt: expiresAt, // TTL for automatic cleanup
   };
   
-  console.log(`Saving scan history - UserId: ${userId}, ScanId: ${scanId}, TableName: ${tableName}`);
+  console.log(`Saving scan history - UserId: ${userId}, ScanId: ${scanId}, RequestId: ${scanData.requestId}, S3Url: ${scanData.s3Url}, TableName: ${tableName}`);
   
   try {
+    // Use conditional put to prevent duplicates atomically
+    // This will fail if an item with the same userId+scanId already exists
     await dynamodb.put({
       TableName: tableName,
       Item: historyItem,
+      ConditionExpression: 'attribute_not_exists(userId) AND attribute_not_exists(scanId)',
     }).promise();
     
     console.log(`✅ Scan history saved successfully for user: ${userId}, scan: ${scanId}`);
     return historyItem;
   } catch (error) {
+    // If conditional put fails due to item already existing, that's okay - it's a duplicate
+    if (error.code === 'ConditionalCheckFailedException') {
+      console.log(`⚠️ Scan with scanId ${scanId} already exists for user ${userId}. Skipping duplicate save.`);
+      // Try to get the existing item
+      try {
+        const existing = await dynamodb.get({
+          TableName: tableName,
+          Key: { userId: userId, scanId: scanId },
+        }).promise();
+        if (existing.Item) {
+          return existing.Item;
+        }
+      } catch (getError) {
+        console.warn('Could not retrieve existing scan:', getError.message);
+      }
+      return historyItem; // Return the item we tried to save
+    }
+    
     console.error('❌ Error saving scan history:', {
       error: error.message,
       code: error.code,
@@ -803,7 +906,7 @@ exports.handler = async (event) => {
     console.log(`Uploading image to S3 (${sizeMB}MB, ${contentType})...`);
     let s3Url;
     try {
-      s3Url = await uploadToS3(imageBuffer, contentType, extension, config.s3Bucket);
+      s3Url = await uploadToS3(imageBuffer, contentType, extension, config.s3Bucket, deviceInfo.requestId);
       console.log('Image uploaded to S3:', s3Url);
     } catch (error) {
       if (error.code === 'InvalidUserID.NotFound' || error.code === 'InvalidClientTokenId' || error.message.includes('security token')) {
@@ -918,39 +1021,8 @@ exports.handler = async (event) => {
       }
     }
 
-    // Save scan history synchronously (await before sending response)
-    let scanHistorySaved = false;
-    if (userId) {
-      console.log('=== Saving Scan History (Synchronously) ===');
-      const historyData = {
-        success: true,
-        status: formalizedResponse.status,
-        deepfakeScore: formalizedResponse.deepfakeScore,
-        sightengineRequestId: sightengineResponse?.request?.id || sightengineResponse?.request?.timestamp || deviceInfo.requestId,
-        s3Url: s3Url,
-        requestId: deviceInfo.requestId,
-      };
-      
-      try {
-        await saveScanHistory(userId, historyData);
-        scanHistorySaved = true;
-        console.log('✅ Scan history saved successfully (synchronously)');
-      } catch (err) {
-        console.error('❌ Failed to save scan history:', {
-          error: err.message,
-          code: err.code,
-          userId: userId,
-          stack: err.stack,
-        });
-        scanHistorySaved = false;
-        // Continue even if scan history save fails - don't block the response
-      }
-    } else {
-      console.warn('⚠️ User ID not found in request, skipping scan history save');
-      console.warn('This might be a guest user or token extraction failed');
-    }
-
-    // Prepare response with token balance and history save status
+    // Prepare response with token balance
+    // Note: Scan history is now saved manually by user via "Save to History" button
     const response = {
       statusCode: 200,
       headers,
@@ -963,9 +1035,7 @@ exports.handler = async (event) => {
           tokenBalance: tokenBalance,
           scansRemaining: tokenBalance,
         }),
-        // Include scan history save status
-        scanHistorySaved: scanHistorySaved,
-        // Optionally include request tracking info (remove in production if sensitive)
+        // Include request tracking info for manual history save
         requestId: deviceInfo.requestId,
       }),
     };
