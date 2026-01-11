@@ -95,13 +95,13 @@ function formatEventForCAPI(eventName, params = {}, eventId = null) {
 
   // Add user data if available
   if (user_id) {
-    eventData.user_data.external_id = user_id;
+    eventData.user_data.external_id = hashValue(String(user_id));
   }
   if (email) {
-    eventData.user_data.em = email; // Email (hashed)
+    eventData.user_data.em = hashValue(email); // Email must be hashed with SHA-256
   }
   if (phone) {
-    eventData.user_data.ph = phone; // Phone (hashed)
+    eventData.user_data.ph = hashValue(phone); // Phone must be hashed with SHA-256
   }
 
   // Add browser/client identifiers

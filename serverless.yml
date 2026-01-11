@@ -303,6 +303,17 @@ functions:
           path: admin/purchases
           method: get
           cors: true
+  metaCapi:
+    handler: meta-capi-handler.handler
+    events:
+      - http:
+          path: meta/capi
+          method: post
+          cors: true
+      - http:
+          path: meta/capi
+          method: options
+          cors: true
 
 resources:
   Resources:
