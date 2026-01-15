@@ -2,6 +2,7 @@
 require('dotenv').config();
 
 const AWS = require('aws-sdk');
+const { wrapHandler } = require('./middleware/errorHandler');
 const crypto = require('crypto');
 
 // Configure AWS SDK
@@ -167,9 +168,9 @@ async function handleWebhookEvent(event) {
 }
 
 /**
- * Lambda handler
+ * Lambda handler (wrapped with Sentry)
  */
-exports.handler = async (event) => {
+const handler = async (event) => {
   console.log('Received webhook event:', JSON.stringify(event, null, 2));
 
   const headers = {
@@ -251,3 +252,5 @@ exports.handler = async (event) => {
   }
 };
 
+// Wrap handler with Sentry error tracking
+exports.handler = wrapHandler(handler);

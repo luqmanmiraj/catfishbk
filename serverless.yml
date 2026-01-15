@@ -48,6 +48,9 @@ provider:
     PURCHASES_TABLE: ${self:service}-${self:provider.stage}-purchases
     # Admin configuration
     ADMIN_GROUP_NAME: ${env:ADMIN_GROUP_NAME, 'admin'}
+    # Sentry error monitoring configuration
+    SENTRY_DSN: ${env:SENTRY_DSN, ''}
+    SENTRY_ENVIRONMENT: ${self:provider.stage}
   iam:
     role:
       statements:
@@ -312,6 +315,25 @@ functions:
           cors: true
       - http:
           path: meta/capi
+          method: options
+          cors: true
+  health:
+    handler: health-handler.handler
+    events:
+      - http:
+          path: health
+          method: get
+          cors: true
+      - http:
+          path: health/live
+          method: get
+          cors: true
+      - http:
+          path: health
+          method: options
+          cors: true
+      - http:
+          path: health/live
           method: options
           cors: true
 

@@ -3,6 +3,7 @@ require('dotenv').config();
 
 const AWS = require('aws-sdk');
 const { v4: uuidv4 } = require('uuid');
+const { wrapHandler, captureException } = require('./middleware/errorHandler');
 
 // Configure AWS SDK
 const awsConfig = {
@@ -169,9 +170,9 @@ async function canUserScan(userId) {
 }
 
 /**
- * Lambda handler for subscription status check
+ * Lambda handler for subscription status check (wrapped with Sentry)
  */
-exports.handler = async (event) => {
+const handler = async (event) => {
   console.log('Subscription handler event:', JSON.stringify(event, null, 2));
 
   const headers = {
@@ -433,3 +434,5 @@ exports.handler = async (event) => {
   }
 };
 
+// Wrap handler with Sentry error tracking
+exports.handler = wrapHandler(handler);
