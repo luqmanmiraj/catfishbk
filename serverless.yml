@@ -51,6 +51,10 @@ provider:
     # Sentry error monitoring configuration
     SENTRY_DSN: ${env:SENTRY_DSN, ''}
     SENTRY_ENVIRONMENT: ${self:provider.stage}
+    # Meta CAPI configuration
+    META_PIXEL_ID: ${env:META_PIXEL_ID, ''}
+    META_ACCESS_TOKEN: ${env:META_ACCESS_TOKEN, ''}
+    META_ACCESS_TOKEN_SECRET_NAME: ${env:META_ACCESS_TOKEN_SECRET_NAME, 'catfish/meta-access-token'}
   iam:
     role:
       statements:
