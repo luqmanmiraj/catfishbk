@@ -46,6 +46,9 @@ provider:
     SCAN_HISTORY_TABLE: ${self:service}-${self:provider.stage}-scan-history
     TOKENS_TABLE: ${self:service}-${self:provider.stage}-tokens
     PURCHASES_TABLE: ${self:service}-${self:provider.stage}-purchases
+    DEVICE_SCANS_TABLE: ${self:service}-${self:provider.stage}-device-scans
+    # Device-level free scan limit
+    DEVICE_FREE_SCAN_LIMIT: ${env:DEVICE_FREE_SCAN_LIMIT, '5'}
     # Admin configuration
     ADMIN_GROUP_NAME: ${env:ADMIN_GROUP_NAME, 'admin'}
     # Sentry error monitoring configuration
@@ -113,6 +116,7 @@ provider:
             - !Sub 'arn:aws:dynamodb:${self:provider.region}:*:table/${self:service}-${self:provider.stage}-scan-history'
             - !Sub 'arn:aws:dynamodb:${self:provider.region}:*:table/${self:service}-${self:provider.stage}-tokens'
             - !Sub 'arn:aws:dynamodb:${self:provider.region}:*:table/${self:service}-${self:provider.stage}-purchases'
+            - !Sub 'arn:aws:dynamodb:${self:provider.region}:*:table/${self:service}-${self:provider.stage}-device-scans'
             - !Sub 'arn:aws:dynamodb:${self:provider.region}:*:table/${self:service}-${self:provider.stage}-scan-history/index/*'
             - !Sub 'arn:aws:dynamodb:${self:provider.region}:*:table/${self:service}-${self:provider.stage}-purchases/index/*'
         - Effect: Allow
@@ -580,6 +584,18 @@ resources:
                 KeyType: RANGE
             Projection:
               ProjectionType: ALL
+    # Device Scans DynamoDB Table (tracks free scans per physical device)
+    DeviceScansTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:service}-${self:provider.stage}-device-scans
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: deviceId
+            AttributeType: S
+        KeySchema:
+          - AttributeName: deviceId
+            KeyType: HASH
   Outputs:
     CognitoUserPoolId:
       Description: Cognito User Pool ID

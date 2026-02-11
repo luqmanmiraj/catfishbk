@@ -4,6 +4,7 @@ require('dotenv').config();
 const AWS = require('aws-sdk');
 const { v4: uuidv4 } = require('uuid');
 const { wrapHandler, captureException } = require('./middleware/errorHandler');
+const { getDeviceScanCount, hasUserPurchased, getDeviceFreeScanLimit } = require('./device-scan-helpers');
 
 // Configure AWS SDK
 const awsConfig = {
@@ -30,11 +31,13 @@ const USER_POOL_ID = process.env.COGNITO_USER_POOL_ID || '';
 const SUBSCRIPTIONS_TABLE = process.env.SUBSCRIPTIONS_TABLE || 'image-analysis-dev-subscriptions';
 const SCAN_COUNTS_TABLE = process.env.SCAN_COUNTS_TABLE || 'image-analysis-dev-scan-counts';
 
-// Token pack configurations
+// Token pack configurations (must match App Store / RevenueCat product IDs)
 const TOKEN_PACKS = {
+  'pack_5': { tokens: 5, price: 4.99 },
   'pack_15': { tokens: 15, price: 4.99 },
-  'pack_50': { tokens: 50, price: 9.99 },
-  'pack_100': { tokens: 100, price: 16.99 },
+  'pack_20': { tokens: 20, price: 14.99 },
+  'pack_50': { tokens: 50, price: 8.49 },
+  'pack_100': { tokens: 100, price: 14.44 },
 };
 
 /**
@@ -76,33 +79,19 @@ async function savePurchase(userId, packId, tokens, price, transactionId) {
  */
 async function getTokenBalance(userId) {
   try {
-    console.log('🔍 getTokenBalance called with userId:', userId);
-    console.log('  - Querying table:', TOKENS_TABLE);
-    
     const result = await dynamodb.get({
       TableName: TOKENS_TABLE,
       Key: { userId: userId },
     }).promise();
 
-    console.log('  - DynamoDB get result:', JSON.stringify(result, null, 2));
-
     if (!result.Item) {
       // No token record, default to 0
-      console.log('  - ⚠️ No token record found for userId:', userId);
       return 0;
     }
 
-    const balance = result.Item.balance || 0;
-    console.log('  - ✅ Found token record, balance:', balance);
-    return balance;
+    return result.Item.balance || 0;
   } catch (error) {
-    console.error('❌ Error getting token balance:', error);
-    console.error('  - Error details:', {
-      message: error.message,
-      code: error.code,
-      userId: userId,
-      tableName: TOKENS_TABLE,
-    });
+    console.error('Error getting token balance:', error);
     return 0;
   }
 }
@@ -192,7 +181,7 @@ const handler = async (event) => {
   const headers = {
     'Content-Type': 'application/json',
     'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+    'Access-Control-Allow-Headers': 'Content-Type,Authorization,X-Device-ID,Device-ID',
     'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
   };
 
@@ -210,9 +199,11 @@ const handler = async (event) => {
     let userId = null;
 
     // Try to get from Authorization header (Cognito token)
-    if (event.headers && event.headers.Authorization) {
+    // Check both cases - API Gateway may preserve or lowercase the header
+    const authHeader = event.headers && (event.headers.Authorization || event.headers.authorization);
+    if (authHeader) {
       try {
-        const token = event.headers.Authorization.replace('Bearer ', '');
+        const token = authHeader.replace('Bearer ', '');
         // Decode JWT to get user ID (simplified - in production use proper JWT library)
         const tokenParts = token.split('.');
         if (tokenParts.length === 3) {
@@ -246,16 +237,35 @@ const handler = async (event) => {
     const path = event.path || '';
     const method = event.httpMethod || 'GET';
 
-    // GET /subscription/status - Get token balance (maintained for backward compatibility)
+    // GET /subscription/status - Get token balance and device scan info
     if ((method === 'GET' && path.includes('/status')) || method === 'GET') {
-      console.log('📊 GET /subscription/status - Fetching token balance');
-      console.log('  - Extracted userId:', userId);
-      console.log('  - Table name:', TOKENS_TABLE);
-      
       const tokenBalance = await getTokenBalance(userId);
-      
-      console.log('  - Token balance from DB:', tokenBalance);
-      console.log('  - Returning response with tokenBalance:', tokenBalance);
+
+      // Extract device ID from header for device-level scan tracking
+      const requestHeaders = event.headers || {};
+      const deviceId = requestHeaders['X-Device-ID'] || requestHeaders['x-device-id'] ||
+                        requestHeaders['Device-ID'] || requestHeaders['device-id'] || null;
+
+      // Gather device-level scan info if device ID is available
+      let deviceFreeScansUsed = 0;
+      let deviceFreeScansLimit = getDeviceFreeScanLimit();
+      let deviceLimitReached = false;
+      let hasPurchased = false;
+
+      if (deviceId) {
+        try {
+          deviceFreeScansUsed = await getDeviceScanCount(deviceId);
+          deviceLimitReached = deviceFreeScansUsed >= deviceFreeScansLimit;
+        } catch (err) {
+          console.error('Error getting device scan count for status:', err);
+        }
+      }
+
+      try {
+        hasPurchased = await hasUserPurchased(userId);
+      } catch (err) {
+        console.error('Error checking user purchase status:', err);
+      }
 
       return {
         statusCode: 200,
@@ -264,6 +274,11 @@ const handler = async (event) => {
           success: true,
           tokenBalance: tokenBalance,
           scansRemaining: tokenBalance,
+          // Device-level scan tracking
+          deviceFreeScansUsed: deviceFreeScansUsed,
+          deviceFreeScansLimit: deviceFreeScansLimit,
+          deviceLimitReached: deviceLimitReached,
+          hasPurchased: hasPurchased,
           // Legacy fields for backward compatibility
           subscription: {
             tier: 'token',

@@ -2,6 +2,7 @@
 require('dotenv').config();
 
 const AWS = require('aws-sdk');
+const { isDeviceExhausted, getDeviceScanCount, getDeviceFreeScanLimit } = require('./device-scan-helpers');
 
 // Configure AWS SDK
 const awsConfig = {
@@ -33,7 +34,7 @@ const TOKENS_TABLE = process.env.TOKENS_TABLE || 'image-analysis-dev-tokens';
 function getCorsHeaders() {
   return {
     'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+    'Access-Control-Allow-Headers': 'Content-Type,Authorization,X-Device-ID,Device-ID',
     'Access-Control-Allow-Methods': 'POST,OPTIONS,GET',
     'Content-Type': 'application/json',
   };
@@ -100,8 +101,10 @@ async function signUp(email, password, name = null) {
 
 /**
  * Confirm sign up with verification code
+ * After successful confirmation, grants 5 free tokens to the new user
+ * unless the device has already exhausted its free scan allotment.
  */
-async function confirmSignUp(email, confirmationCode) {
+async function confirmSignUp(email, confirmationCode, deviceId = null) {
   if (!USER_POOL_ID || !CLIENT_ID) {
     throw new Error('Cognito configuration missing. USER_POOL_ID and CLIENT_ID must be set.');
   }
@@ -114,9 +117,57 @@ async function confirmSignUp(email, confirmationCode) {
 
   try {
     await cognitoIdentityServiceProvider.confirmSignUp(params).promise();
+
+    // Check device-level free scan limit before granting tokens
+    let deviceExhausted = false;
+    if (deviceId) {
+      try {
+        deviceExhausted = await isDeviceExhausted(deviceId);
+        if (deviceExhausted) {
+          const scanCount = await getDeviceScanCount(deviceId);
+          console.warn(`⚠️ Device ${deviceId} has exhausted free scans (${scanCount}/${getDeviceFreeScanLimit()}) — skipping free token grant for ${email}`);
+        }
+      } catch (err) {
+        console.error('Error checking device scan limit during confirm signup:', err);
+        // Fail open — grant tokens if check fails
+      }
+    }
+
+    // After successful email verification, add free tokens for new users
+    // Only grant tokens if device has NOT exhausted its free scan allotment
+    let freeTokensGranted = false;
+    try {
+      const userResult = await cognitoIdentityServiceProvider.adminGetUser({
+        UserPoolId: USER_POOL_ID,
+        Username: email,
+      }).promise();
+
+      const subAttr = userResult.UserAttributes.find(attr => attr.Name === 'sub');
+      if (subAttr) {
+        if (!deviceExhausted) {
+          await addTokensToUser(subAttr.Value, 5);
+          freeTokensGranted = true;
+          console.log(`✅ Added 5 free tokens for new user: ${subAttr.Value} (${email})`);
+        } else {
+          // Initialize token record with 0 balance
+          await addTokensToUser(subAttr.Value, 0);
+          console.log(`⚠️ Device exhausted — user ${subAttr.Value} (${email}) confirmed with 0 free tokens`);
+        }
+      } else {
+        console.warn(`⚠️ Could not find sub attribute for user: ${email}`);
+      }
+    } catch (tokenError) {
+      console.error('Error adding free tokens after signup confirmation:', tokenError);
+      // Don't fail the confirmation if token addition fails - user can still sign in
+    }
+
     return {
       success: true,
-      message: 'Email verified successfully. You can now sign in.',
+      freeTokensGranted: freeTokensGranted,
+      deviceLimitReached: deviceExhausted,
+      message: deviceExhausted
+        ? 'Email verified successfully. Note: This device has used all free scans. Purchase a scan pack to start scanning.'
+        : 'Email verified successfully. You can now sign in.',
     };
   } catch (error) {
     if (error.code === 'CodeMismatchException') {
@@ -392,6 +443,7 @@ async function addTokensToUser(userId, amount) {
 
 /**
  * Guest sign up - creates a temporary user account with device ID
+ * Checks device-level free scan limit before granting tokens.
  */
 async function guestSignUp(deviceId) {
   if (!USER_POOL_ID || !CLIENT_ID) {
@@ -400,6 +452,19 @@ async function guestSignUp(deviceId) {
 
   if (!deviceId) {
     throw new Error('Device ID is required for guest signup.');
+  }
+
+  // Check if this device has already exhausted its free scan allotment
+  let deviceExhausted = false;
+  try {
+    deviceExhausted = await isDeviceExhausted(deviceId);
+    if (deviceExhausted) {
+      const scanCount = await getDeviceScanCount(deviceId);
+      console.warn(`⚠️ Device ${deviceId} has exhausted free scans (${scanCount}/${getDeviceFreeScanLimit()})`);
+    }
+  } catch (err) {
+    console.error('Error checking device scan limit during guest signup:', err);
+    // Fail open — allow guest signup if check fails
   }
 
   // Generate a unique email for the guest user based on device ID
@@ -432,7 +497,10 @@ async function guestSignUp(deviceId) {
 
     if (existingUser) {
       // User already exists, use existing user
-      userSub = existingUser.Username;
+      // Extract the sub (UUID) from user attributes - this matches the JWT's sub claim
+      const existingSubAttr = existingUser.Attributes && 
+        existingUser.Attributes.find(attr => attr.Name === 'sub');
+      userSub = existingSubAttr ? existingSubAttr.Value : existingUser.Username;
       username = existingUser.Username;
       
       // Try to sign in with existing user
@@ -509,11 +577,28 @@ async function guestSignUp(deviceId) {
           throw createError;
         }
       }
-      userSub = createResult.User.Username;
       username = createResult.User.Username;
       
-      // Add 5 free tokens for new guest users
-      await addTokensToUser(userSub, 5);
+      // Extract the user's sub (UUID) from response attributes
+      // This is critical: the JWT's sub claim uses this UUID, and the subscription handler
+      // looks up tokens by JWT sub. We MUST store tokens with this UUID, not the Username
+      // (which is the email when UsernameAttributes includes email).
+      const subAttr = createResult.User.Attributes && 
+        createResult.User.Attributes.find(attr => attr.Name === 'sub');
+      userSub = subAttr ? subAttr.Value : createResult.User.Username;
+      
+      console.log(`Guest user created - Username: ${username}, Sub (UUID): ${userSub}`);
+      
+      // Add 5 free tokens for new guest users (using sub UUID as key)
+      // Only grant free tokens if the device has NOT exhausted its free scan allotment
+      if (!deviceExhausted) {
+        await addTokensToUser(userSub, 5);
+        console.log(`✅ Granted 5 free tokens to new guest user: ${userSub}`);
+      } else {
+        // Initialize with 0 tokens — device has already used its free scans
+        await addTokensToUser(userSub, 0);
+        console.log(`⚠️ Device exhausted — guest user ${userSub} created with 0 tokens`);
+      }
     }
 
     // Sign in the guest user
@@ -578,7 +663,10 @@ async function guestSignUp(deviceId) {
         tokenType: authResult.AuthenticationResult.TokenType,
         isGuest: true,
         deviceId: deviceId,
-        message: 'Guest account created successfully.',
+        deviceLimitReached: deviceExhausted,
+        message: deviceExhausted
+          ? 'Guest account created but device has used all free scans. Please purchase a scan pack.'
+          : 'Guest account created successfully.',
       };
     } catch (signInError) {
       // If sign in fails, try to set permanent password and retry
@@ -624,7 +712,10 @@ async function guestSignUp(deviceId) {
             tokenType: finalAuthResult.AuthenticationResult.TokenType,
             isGuest: true,
             deviceId: deviceId,
-            message: 'Guest account created successfully.',
+            deviceLimitReached: deviceExhausted,
+            message: deviceExhausted
+              ? 'Guest account created but device has used all free scans. Please purchase a scan pack.'
+              : 'Guest account created successfully.',
           };
         }
 
@@ -638,7 +729,10 @@ async function guestSignUp(deviceId) {
           tokenType: authResult.AuthenticationResult.TokenType,
           isGuest: true,
           deviceId: deviceId,
-          message: 'Guest account created successfully.',
+          deviceLimitReached: deviceExhausted,
+          message: deviceExhausted
+            ? 'Guest account created but device has used all free scans. Please purchase a scan pack.'
+            : 'Guest account created successfully.',
         };
       } catch (retryError) {
         console.error('Error signing in guest user:', retryError);
@@ -741,7 +835,7 @@ exports.handler = async (event) => {
     }
 
     if ((path.includes('/confirm-signup') || path.endsWith('/confirm-signup')) && method === 'POST') {
-      const { email, confirmationCode } = body;
+      const { email, confirmationCode, deviceId } = body;
       
       if (!email || !confirmationCode) {
         return {
@@ -754,7 +848,7 @@ exports.handler = async (event) => {
         };
       }
 
-      const result = await confirmSignUp(email, confirmationCode);
+      const result = await confirmSignUp(email, confirmationCode, deviceId || null);
       return {
         statusCode: 200,
         headers,
