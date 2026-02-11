@@ -32,9 +32,9 @@ const SCAN_COUNTS_TABLE = process.env.SCAN_COUNTS_TABLE || 'image-analysis-dev-s
 
 // Token pack configurations
 const TOKEN_PACKS = {
-  'pack_5': { tokens: 5, price: 4.99 },
-  'pack_20': { tokens: 20, price: 14.99 },
-  'pack_50': { tokens: 50, price: 29.99 },
+  'pack_15': { tokens: 15, price: 4.99 },
+  'pack_50': { tokens: 50, price: 9.99 },
+  'pack_100': { tokens: 100, price: 16.99 },
 };
 
 /**
@@ -76,19 +76,33 @@ async function savePurchase(userId, packId, tokens, price, transactionId) {
  */
 async function getTokenBalance(userId) {
   try {
+    console.log('🔍 getTokenBalance called with userId:', userId);
+    console.log('  - Querying table:', TOKENS_TABLE);
+    
     const result = await dynamodb.get({
       TableName: TOKENS_TABLE,
       Key: { userId: userId },
     }).promise();
 
+    console.log('  - DynamoDB get result:', JSON.stringify(result, null, 2));
+
     if (!result.Item) {
       // No token record, default to 0
+      console.log('  - ⚠️ No token record found for userId:', userId);
       return 0;
     }
 
-    return result.Item.balance || 0;
+    const balance = result.Item.balance || 0;
+    console.log('  - ✅ Found token record, balance:', balance);
+    return balance;
   } catch (error) {
-    console.error('Error getting token balance:', error);
+    console.error('❌ Error getting token balance:', error);
+    console.error('  - Error details:', {
+      message: error.message,
+      code: error.code,
+      userId: userId,
+      tableName: TOKENS_TABLE,
+    });
     return 0;
   }
 }
@@ -234,7 +248,14 @@ const handler = async (event) => {
 
     // GET /subscription/status - Get token balance (maintained for backward compatibility)
     if ((method === 'GET' && path.includes('/status')) || method === 'GET') {
+      console.log('📊 GET /subscription/status - Fetching token balance');
+      console.log('  - Extracted userId:', userId);
+      console.log('  - Table name:', TOKENS_TABLE);
+      
       const tokenBalance = await getTokenBalance(userId);
+      
+      console.log('  - Token balance from DB:', tokenBalance);
+      console.log('  - Returning response with tokenBalance:', tokenBalance);
 
       return {
         statusCode: 200,

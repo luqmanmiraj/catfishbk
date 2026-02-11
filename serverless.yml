@@ -55,6 +55,7 @@ provider:
     META_PIXEL_ID: ${env:META_PIXEL_ID, ''}
     META_ACCESS_TOKEN: ${env:META_ACCESS_TOKEN, ''}
     META_ACCESS_TOKEN_SECRET_NAME: ${env:META_ACCESS_TOKEN_SECRET_NAME, 'catfish/meta-access-token'}
+    META_GRAPH_API_VERSION: ${env:META_GRAPH_API_VERSION, 'v22.0'}
   iam:
     role:
       statements:
