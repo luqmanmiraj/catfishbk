@@ -835,6 +835,104 @@ exports.handler = async (event) => {
       deviceInfo.deviceId = body.deviceId;
     }
 
+    // === Pre-scan validation: Auth, tokens, and device limits ===
+    // These checks happen BEFORE the expensive API call to avoid wasting credits
+    
+    // Extract user identity from token
+    const token = extractToken(event);
+    const userId = extractUserId(event, body);
+    
+    console.log('=== Token and User ID Extraction ===');
+    console.log('Token present:', !!token);
+    console.log('User ID extracted:', userId || 'NONE');
+
+    // Block unauthenticated scans — all users must be authenticated
+    if (!userId) {
+      console.warn('⚠️ Unauthenticated scan request blocked');
+      return {
+        statusCode: 401,
+        headers: {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+        },
+        body: JSON.stringify({
+          success: false,
+          error: 'Authentication required. Please sign in or continue as guest to scan.',
+        }),
+      };
+    }
+
+    // Get device ID for device-level scan tracking
+    const deviceId = deviceInfo.deviceId || null;
+    console.log('=== Device ID for scan tracking ===');
+    console.log('Device ID:', deviceId || 'NONE');
+
+    // Check token balance
+    let tokenBalance = null;
+    console.log('=== Checking Token Balance ===');
+    try {
+      tokenBalance = await getTokenBalance(userId);
+      console.log(`✅ Token balance retrieved: ${tokenBalance} tokens`);
+      
+      if (tokenBalance <= 0) {
+        console.warn('⚠️ User has insufficient tokens, blocking scan');
+        return {
+          statusCode: 402,
+          headers: {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*',
+          },
+          body: JSON.stringify({
+            success: false,
+            error: 'Insufficient tokens. Please purchase a scan pack to continue.',
+            tokenBalance: tokenBalance,
+            scansRemaining: tokenBalance,
+          }),
+        };
+      }
+    } catch (err) {
+      console.error('❌ Failed to check token balance:', {
+        error: err.message,
+        code: err.code,
+        userId: userId,
+        stack: err.stack,
+      });
+    }
+
+    // Device-level free scan limit enforcement
+    // Paid users (those who have purchased token packs) bypass device limits
+    if (deviceId) {
+      console.log('=== Checking Device-Level Scan Limit ===');
+      try {
+        const userHasPurchased = await hasUserPurchased(userId);
+        if (!userHasPurchased) {
+          const deviceExhausted = await isDeviceExhausted(deviceId);
+          if (deviceExhausted) {
+            const deviceScanCount = await getDeviceScanCount(deviceId);
+            console.warn(`⚠️ Device ${deviceId} has exhausted free scans (${deviceScanCount}/${getDeviceFreeScanLimit()})`);
+            return {
+              statusCode: 403,
+              headers: {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*',
+              },
+              body: JSON.stringify({
+                success: false,
+                error: 'This device has used all free scans. Please purchase a scan pack to continue.',
+                deviceLimitReached: true,
+                deviceFreeScansUsed: deviceScanCount,
+                deviceFreeScansLimit: getDeviceFreeScanLimit(),
+              }),
+            };
+          }
+        } else {
+          console.log('✅ User has purchased tokens — bypassing device limit check');
+        }
+      } catch (err) {
+        console.error('❌ Failed to check device scan limit:', err);
+      }
+    }
+
     // Extract image data - support both base64 image and URL
     let imageUrl;
     let s3Url = null;
@@ -945,104 +1043,8 @@ exports.handler = async (event) => {
     const formalizedResponse = formalizeGowinstonResponse(gowinstonResult.data, apiProcessingTime);
     console.log('Formalized response:', JSON.stringify(formalizedResponse, null, 2));
 
-    // Extract token and Cognito user ID from request
-    const token = extractToken(event);
-    const userId = extractUserId(event, body);
-    
-    console.log('=== Token and User ID Extraction ===');
-    console.log('Token present:', !!token);
-    console.log('User ID extracted:', userId || 'NONE');
-
-    // Block unauthenticated scans — all users must be authenticated
-    if (!userId) {
-      console.warn('⚠️ Unauthenticated scan request blocked');
-      return {
-        statusCode: 401,
-        headers: {
-          'Content-Type': 'application/json',
-          'Access-Control-Allow-Origin': '*',
-        },
-        body: JSON.stringify({
-          success: false,
-          error: 'Authentication required. Please sign in or continue as guest to scan.',
-        }),
-      };
-    }
-
-    // Extract device ID for device-level scan tracking
-    const deviceInfo = extractDeviceInfo(event);
-    const deviceId = deviceInfo.deviceId || (body && body.deviceId) || null;
-    console.log('=== Device ID for scan tracking ===');
-    console.log('Device ID:', deviceId || 'NONE');
-
-    // Check token balance before processing scan
-    let tokenBalance = null;
-    console.log('=== Checking Token Balance ===');
-    try {
-      tokenBalance = await getTokenBalance(userId);
-      console.log(`✅ Token balance retrieved: ${tokenBalance} tokens`);
-      
-      if (tokenBalance <= 0) {
-        console.warn('⚠️ User has insufficient tokens, blocking scan');
-        return {
-          statusCode: 402, // Payment Required
-          headers: {
-            'Content-Type': 'application/json',
-            'Access-Control-Allow-Origin': '*',
-          },
-          body: JSON.stringify({
-            success: false,
-            error: 'Insufficient tokens. Please purchase a scan pack to continue.',
-            tokenBalance: tokenBalance,
-            scansRemaining: tokenBalance,
-          }),
-        };
-      }
-    } catch (err) {
-      console.error('❌ Failed to check token balance:', {
-        error: err.message,
-        code: err.code,
-        userId: userId,
-        stack: err.stack,
-      });
-      // Continue with scan even if token check fails (graceful degradation)
-    }
-
-    // Device-level free scan limit enforcement
-    // Paid users (those who have purchased token packs) bypass device limits
-    if (deviceId) {
-      console.log('=== Checking Device-Level Scan Limit ===');
-      try {
-        const userHasPurchased = await hasUserPurchased(userId);
-        if (!userHasPurchased) {
-          // Free-tier user: enforce device-level limit
-          const deviceExhausted = await isDeviceExhausted(deviceId);
-          if (deviceExhausted) {
-            const deviceScanCount = await getDeviceScanCount(deviceId);
-            console.warn(`⚠️ Device ${deviceId} has exhausted free scans (${deviceScanCount}/${getDeviceFreeScanLimit()})`);
-            return {
-              statusCode: 403,
-              headers: {
-                'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*',
-              },
-              body: JSON.stringify({
-                success: false,
-                error: 'This device has used all free scans. Please purchase a scan pack to continue.',
-                deviceLimitReached: true,
-                deviceFreeScansUsed: deviceScanCount,
-                deviceFreeScansLimit: getDeviceFreeScanLimit(),
-              }),
-            };
-          }
-        } else {
-          console.log('✅ User has purchased tokens — bypassing device limit check');
-        }
-      } catch (err) {
-        console.error('❌ Failed to check device scan limit:', err);
-        // Fail open — don't block if device check fails
-      }
-    }
+    // === Post-scan tracking: Decrement token and increment device counter ===
+    // These happen AFTER a successful scan
 
     // Decrement token after successful scan
     if (tokenBalance !== null && tokenBalance > 0) {
@@ -1058,7 +1060,6 @@ exports.handler = async (event) => {
           userId: userId,
           stack: err.stack,
         });
-        // Continue even if token decrement fails - don't block the response
       }
     }
 
@@ -1069,7 +1070,6 @@ exports.handler = async (event) => {
         console.log(`✅ Device scan counter incremented for device: ${deviceId}`);
       } catch (err) {
         console.error('❌ Failed to increment device scan counter:', err);
-        // Non-critical — don't block the response
       }
     }
 

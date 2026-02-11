@@ -25,8 +25,11 @@ const dynamodb = new AWS.DynamoDB.DocumentClient();
 const USER_POOL_ID = process.env.COGNITO_USER_POOL_ID;
 const CLIENT_ID = process.env.COGNITO_USER_POOL_CLIENT_ID;
 
-// Get tokens table name from environment variables
+// Get table names from environment variables
 const TOKENS_TABLE = process.env.TOKENS_TABLE || 'image-analysis-dev-tokens';
+const SCAN_HISTORY_TABLE = process.env.SCAN_HISTORY_TABLE || 'image-analysis-dev-scan-history';
+const PURCHASES_TABLE = process.env.PURCHASES_TABLE || 'image-analysis-dev-purchases';
+const SCAN_COUNTS_TABLE = process.env.SCAN_COUNTS_TABLE || 'image-analysis-dev-scan-counts';
 
 /**
  * CORS headers
@@ -35,7 +38,7 @@ function getCorsHeaders() {
   return {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Headers': 'Content-Type,Authorization,X-Device-ID,Device-ID',
-    'Access-Control-Allow-Methods': 'POST,OPTIONS,GET',
+    'Access-Control-Allow-Methods': 'POST,OPTIONS,GET,DELETE',
     'Content-Type': 'application/json',
   };
 }
@@ -302,10 +305,26 @@ async function refreshToken(refreshToken) {
 
 /**
  * Forgot password - initiate password reset
+ * Explicitly checks if user exists first (Cognito may silently succeed for deleted users)
  */
 async function forgotPassword(email) {
   if (!USER_POOL_ID || !CLIENT_ID) {
     throw new Error('Cognito configuration missing. USER_POOL_ID and CLIENT_ID must be set.');
+  }
+
+  // Explicitly check if the user exists before attempting forgot password
+  // Cognito's "Prevent user existence errors" setting may silently succeed for non-existent users
+  try {
+    await cognitoIdentityServiceProvider.adminGetUser({
+      UserPoolId: USER_POOL_ID,
+      Username: email,
+    }).promise();
+  } catch (lookupError) {
+    if (lookupError.code === 'UserNotFoundException') {
+      throw new Error('User not found.');
+    }
+    // For any other error (permissions, etc.), continue with forgotPassword
+    // and let Cognito handle it
   }
 
   const params = {
@@ -386,6 +405,154 @@ async function getUserInfo(accessToken) {
   } catch (error) {
     if (error.code === 'NotAuthorizedException') {
       throw new Error('Invalid or expired access token.');
+    }
+    throw error;
+  }
+}
+
+/**
+ * Delete all items from a DynamoDB table for a given userId (batch delete)
+ * Used for tables with composite keys (userId + sortKey)
+ */
+async function deleteAllUserItems(tableName, userId, sortKeyName) {
+  try {
+    // Query all items for this user
+    const queryResult = await dynamodb.query({
+      TableName: tableName,
+      KeyConditionExpression: 'userId = :userId',
+      ExpressionAttributeValues: { ':userId': userId },
+      ProjectionExpression: `userId, ${sortKeyName}`,
+    }).promise();
+
+    const items = queryResult.Items || [];
+    if (items.length === 0) {
+      console.log(`No items to delete in ${tableName} for user: ${userId}`);
+      return 0;
+    }
+
+    // Batch delete in chunks of 25 (DynamoDB limit)
+    const chunks = [];
+    for (let i = 0; i < items.length; i += 25) {
+      chunks.push(items.slice(i, i + 25));
+    }
+
+    for (const chunk of chunks) {
+      const deleteRequests = chunk.map(item => ({
+        DeleteRequest: {
+          Key: {
+            userId: item.userId,
+            [sortKeyName]: item[sortKeyName],
+          },
+        },
+      }));
+
+      await dynamodb.batchWrite({
+        RequestItems: {
+          [tableName]: deleteRequests,
+        },
+      }).promise();
+    }
+
+    console.log(`Deleted ${items.length} items from ${tableName} for user: ${userId}`);
+    return items.length;
+  } catch (error) {
+    console.warn(`Warning: Error deleting from ${tableName} for user ${userId}:`, error.message);
+    return 0;
+  }
+}
+
+/**
+ * Delete user account - user-initiated
+ * Deletes from Cognito and cleans up all user data from DynamoDB
+ * Does NOT touch device-level data (device-scans table)
+ */
+async function deleteAccount(accessToken) {
+  try {
+    // First, get the user info to find their username/userId
+    const userResult = await cognitoIdentityServiceProvider.getUser({
+      AccessToken: accessToken,
+    }).promise();
+
+    const username = userResult.Username;
+    const userAttributes = {};
+    userResult.UserAttributes.forEach(attr => {
+      userAttributes[attr.Name] = attr.Value;
+    });
+    const userId = userAttributes.sub || username;
+
+    console.log(`Deleting account for user: ${username} (sub: ${userId})`);
+
+    // 1. Delete from Cognito using adminDeleteUser
+    await cognitoIdentityServiceProvider.adminDeleteUser({
+      UserPoolId: USER_POOL_ID,
+      Username: username,
+    }).promise();
+    console.log(`Deleted Cognito user: ${username}`);
+
+    // 2. Delete token balance record
+    try {
+      await dynamodb.delete({
+        TableName: TOKENS_TABLE,
+        Key: { userId: userId },
+      }).promise();
+      console.log(`Deleted tokens record for user: ${userId}`);
+    } catch (dbError) {
+      console.warn(`Warning: Could not delete tokens record for user ${userId}:`, dbError.message);
+    }
+
+    // 3. Delete all scan history (userId + scanId composite key)
+    await deleteAllUserItems(SCAN_HISTORY_TABLE, userId, 'scanId');
+
+    // 4. Delete all scan counts (userId + monthKey composite key)
+    await deleteAllUserItems(SCAN_COUNTS_TABLE, userId, 'monthKey');
+
+    // 5. Delete all purchases (purchaseId is the key, but query by userId GSI)
+    try {
+      const purchaseResult = await dynamodb.query({
+        TableName: PURCHASES_TABLE,
+        IndexName: 'userId-purchaseDate-index',
+        KeyConditionExpression: 'userId = :userId',
+        ExpressionAttributeValues: { ':userId': userId },
+        ProjectionExpression: 'purchaseId',
+      }).promise();
+
+      const purchases = purchaseResult.Items || [];
+      if (purchases.length > 0) {
+        const chunks = [];
+        for (let i = 0; i < purchases.length; i += 25) {
+          chunks.push(purchases.slice(i, i + 25));
+        }
+        for (const chunk of chunks) {
+          const deleteRequests = chunk.map(item => ({
+            DeleteRequest: {
+              Key: { purchaseId: item.purchaseId },
+            },
+          }));
+          await dynamodb.batchWrite({
+            RequestItems: {
+              [PURCHASES_TABLE]: deleteRequests,
+            },
+          }).promise();
+        }
+        console.log(`Deleted ${purchases.length} purchases for user: ${userId}`);
+      }
+    } catch (purchaseError) {
+      console.warn(`Warning: Could not delete purchases for user ${userId}:`, purchaseError.message);
+    }
+
+    // NOTE: Device-level data (device-scans table) is intentionally NOT deleted
+    // so the device free scan limit tracking remains intact
+
+    return {
+      success: true,
+      message: 'Account deleted successfully.',
+    };
+  } catch (error) {
+    if (error.code === 'NotAuthorizedException') {
+      throw new Error('Invalid or expired access token.');
+    }
+    if (error.code === 'UserNotFoundException') {
+      throw new Error('User not found.');
     }
     throw error;
   }
@@ -982,6 +1149,30 @@ exports.handler = async (event) => {
 
       const accessToken = authHeader.replace('Bearer ', '');
       const result = await getUserInfo(accessToken);
+      return {
+        statusCode: 200,
+        headers,
+        body: JSON.stringify(result),
+      };
+    }
+
+    // Delete account (user-initiated)
+    if ((path.includes('/delete-account') || path.endsWith('/delete-account')) && method === 'DELETE') {
+      const authHeader = event.headers?.Authorization || event.headers?.authorization;
+      
+      if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return {
+          statusCode: 401,
+          headers,
+          body: JSON.stringify({
+            success: false,
+            error: 'Authorization header with Bearer token is required',
+          }),
+        };
+      }
+
+      const accessToken = authHeader.replace('Bearer ', '');
+      const result = await deleteAccount(accessToken);
       return {
         statusCode: 200,
         headers,

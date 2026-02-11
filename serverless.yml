@@ -200,6 +200,10 @@ functions:
           path: auth/user
           method: get
           cors: true
+      - http:
+          path: auth/delete-account
+          method: delete
+          cors: true
   webhook:
     handler: webhook-handler.handler
     events:
