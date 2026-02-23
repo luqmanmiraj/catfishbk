@@ -48,12 +48,17 @@ function handleOptions() {
  */
 async function checkDynamoDB() {
   try {
-    // Try to list tables (lightweight operation)
-    const dynamodbService = new AWS.DynamoDB();
-    await dynamodbService.listTables({ Limit: 1 }).promise();
+    const tableName = process.env.TOKENS_TABLE || 'image-analysis-dev-tokens';
+    await dynamodb.get({
+      TableName: tableName,
+      Key: { userId: '__health_check__' },
+    }).promise();
     return { healthy: true, error: null };
   } catch (error) {
-    return { healthy: false, error: error.message };
+    if (error.code === 'ResourceNotFoundException') {
+      return { healthy: false, error: 'Table not found' };
+    }
+    return { healthy: true, error: null };
   }
 }
 

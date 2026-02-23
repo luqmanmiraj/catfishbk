@@ -18,7 +18,9 @@ if (!isLambda && process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_
 AWS.config.update(awsConfig);
 
 const dynamodb = new AWS.DynamoDB.DocumentClient();
+const dynamodbRaw = new AWS.DynamoDB();
 const cognito = new AWS.CognitoIdentityServiceProvider();
+const { TOKEN_PACKS } = require('./lib/tokens');
 
 // Configuration
 const USER_POOL_ID = process.env.COGNITO_USER_POOL_ID;
@@ -27,6 +29,9 @@ const TOKENS_TABLE = process.env.TOKENS_TABLE || 'image-analysis-dev-tokens';
 const PURCHASES_TABLE = process.env.PURCHASES_TABLE || 'image-analysis-dev-purchases';
 const SCAN_HISTORY_TABLE = process.env.SCAN_HISTORY_TABLE || 'image-analysis-dev-scan-history';
 const SCAN_COUNTS_TABLE = process.env.SCAN_COUNTS_TABLE || 'image-analysis-dev-scan-counts';
+const DEVICE_SCANS_TABLE = process.env.DEVICE_SCANS_TABLE || 'image-analysis-dev-device-scans';
+const SUBSCRIPTIONS_TABLE = process.env.SUBSCRIPTIONS_TABLE || 'image-analysis-dev-subscriptions';
+const REQUESTS_TABLE = `${process.env.SERVICE_NAME || 'image-analysis'}-${process.env.STAGE || 'dev'}-requests`;
 
 /**
  * CORS headers
@@ -615,6 +620,316 @@ async function getAllPurchases(limit = 50, lastEvaluatedKey = null) {
 }
 
 /**
+ * Get recent activity: signups, purchases, scans
+ */
+async function getRecentActivity() {
+  const [recentSignups, recentPurchases, recentScans] = await Promise.all([
+    (async () => {
+      try {
+        const result = await cognito.listUsers({
+          UserPoolId: USER_POOL_ID,
+          Limit: 10,
+        }).promise();
+        return (result.Users || []).map(user => {
+          const attrs = {};
+          user.Attributes.forEach(a => { attrs[a.Name] = a.Value; });
+          return {
+            userId: user.Username,
+            username: user.Username,
+            email: attrs.email || '',
+            createdAt: user.UserCreateDate,
+          };
+        }).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+      } catch (err) {
+        console.error('Error fetching recent signups:', err);
+        return [];
+      }
+    })(),
+    (async () => {
+      try {
+        const result = await dynamodb.scan({
+          TableName: PURCHASES_TABLE,
+          Limit: 50,
+        }).promise();
+        return (result.Items || [])
+          .sort((a, b) => new Date(b.purchaseDate || b.createdAt) - new Date(a.purchaseDate || a.createdAt))
+          .slice(0, 10)
+          .map(p => ({
+            purchaseId: p.purchaseId,
+            userId: p.userId,
+            packId: p.packId,
+            tokens: p.tokens,
+            price: p.price,
+            source: p.source || 'unknown',
+            purchaseDate: p.purchaseDate,
+          }));
+      } catch (err) {
+        console.error('Error fetching recent purchases:', err);
+        return [];
+      }
+    })(),
+    (async () => {
+      try {
+        const result = await dynamodb.scan({
+          TableName: SCAN_HISTORY_TABLE,
+          Limit: 50,
+        }).promise();
+        return (result.Items || [])
+          .sort((a, b) => new Date(b.timestamp || b.createdAt) - new Date(a.timestamp || a.createdAt))
+          .slice(0, 10)
+          .map(s => ({
+            scanId: s.scanId,
+            userId: s.userId,
+            timestamp: s.timestamp,
+            status: s.status,
+            label: s.label || null,
+          }));
+      } catch (err) {
+        console.error('Error fetching recent scans:', err);
+        return [];
+      }
+    })(),
+  ]);
+
+  return { recentSignups, recentPurchases, recentScans };
+}
+
+/**
+ * Get user breakdown / segmentation stats
+ */
+async function getUserBreakdown() {
+  const [totalRegistered, guestDevices, usersWithPurchases, usersWithBalance, activeUsersLast30Days] = await Promise.all([
+    (async () => {
+      try {
+        const poolInfo = await cognito.describeUserPool({ UserPoolId: USER_POOL_ID }).promise();
+        return poolInfo.UserPool?.EstimatedNumberOfUsers || 0;
+      } catch (err) {
+        console.error('Error getting user pool stats:', err);
+        return 0;
+      }
+    })(),
+    (async () => {
+      try {
+        const result = await dynamodb.scan({
+          TableName: DEVICE_SCANS_TABLE,
+          Select: 'COUNT',
+        }).promise();
+        return result.Count || 0;
+      } catch (err) {
+        console.error('Error getting device count:', err);
+        return 0;
+      }
+    })(),
+    (async () => {
+      try {
+        const result = await dynamodb.scan({
+          TableName: PURCHASES_TABLE,
+          ProjectionExpression: 'userId',
+        }).promise();
+        const uniqueUsers = new Set((result.Items || []).map(i => i.userId));
+        return uniqueUsers.size;
+      } catch (err) {
+        console.error('Error getting purchase users:', err);
+        return 0;
+      }
+    })(),
+    (async () => {
+      try {
+        const result = await dynamodb.scan({
+          TableName: TOKENS_TABLE,
+          FilterExpression: '#bal > :zero',
+          ExpressionAttributeNames: { '#bal': 'balance' },
+          ExpressionAttributeValues: { ':zero': 0 },
+          Select: 'COUNT',
+        }).promise();
+        return result.Count || 0;
+      } catch (err) {
+        console.error('Error getting balance count:', err);
+        return 0;
+      }
+    })(),
+    (async () => {
+      try {
+        const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+        const result = await dynamodb.scan({
+          TableName: SCAN_HISTORY_TABLE,
+          FilterExpression: '#ts > :since',
+          ExpressionAttributeNames: { '#ts': 'timestamp' },
+          ExpressionAttributeValues: { ':since': thirtyDaysAgo },
+          ProjectionExpression: 'userId',
+        }).promise();
+        const uniqueUsers = new Set((result.Items || []).map(i => i.userId));
+        return uniqueUsers.size;
+      } catch (err) {
+        console.error('Error getting active users:', err);
+        return 0;
+      }
+    })(),
+  ]);
+
+  return { totalRegistered, guestDevices, usersWithPurchases, usersWithBalance, activeUsersLast30Days };
+}
+
+/**
+ * Get sanitized system configuration (no secrets)
+ */
+function getSystemConfig() {
+  const stripeKey = process.env.STRIPE_SECRET_KEY || '';
+  const stripeMode = stripeKey.startsWith('sk_live_') ? 'live' : 'test';
+
+  const pricesConfigured = [];
+  if (process.env.STRIPE_PRICE_PACK_15) pricesConfigured.push('pack_15');
+  if (process.env.STRIPE_PRICE_PACK_50) pricesConfigured.push('pack_50');
+  if (process.env.STRIPE_PRICE_PACK_100) pricesConfigured.push('pack_100');
+
+  const poolId = process.env.COGNITO_USER_POOL_ID || '';
+  const underscoreIdx = poolId.indexOf('_');
+  const maskedPoolId = poolId.length > 8
+    ? poolId.substring(0, underscoreIdx + 1) + '***' + poolId.slice(-4)
+    : poolId;
+
+  return {
+    stage: process.env.STAGE || 'dev',
+    region: process.env.AWS_REGION || 'us-east-1',
+    serviceName: process.env.SERVICE_NAME || 'image-analysis',
+    thresholds: {
+      deepfakeAuthentic: parseFloat(process.env.DEEPFAKE_THRESHOLD_AUTHENTIC) || null,
+      deepfakeDeepfake: parseFloat(process.env.DEEPFAKE_THRESHOLD_DEEPFAKE) || null,
+      gowinstonAuthentic: parseFloat(process.env.GOWINSTON_THRESHOLD_AUTHENTIC) || null,
+      gowinstonDeepfake: parseFloat(process.env.GOWINSTON_THRESHOLD_DEEPFAKE) || null,
+    },
+    deviceFreeScanLimit: parseInt(process.env.DEVICE_FREE_SCAN_LIMIT || '5', 10),
+    scanPacks: TOKEN_PACKS,
+    s3BucketName: process.env.S3_BUCKET_NAME || '',
+    cognitoUserPoolId: maskedPoolId,
+    integrations: {
+      sentryConfigured: !!process.env.SENTRY_DSN,
+      metaPixelConfigured: !!process.env.META_PIXEL_ID,
+      revenueCatConfigured: !!process.env.REVENUECAT_SECRET_KEY,
+    },
+    stripe: {
+      mode: stripeMode,
+      pricesConfigured,
+      webhookConfigured: !!process.env.STRIPE_WEBHOOK_SECRET,
+      webAppUrl: process.env.WEB_APP_URL || 'http://localhost:3000',
+    },
+  };
+}
+
+/**
+ * Get DynamoDB table statistics via DescribeTable
+ */
+async function getTableStats() {
+  const tables = [
+    { name: 'requests', fullName: REQUESTS_TABLE },
+    { name: 'subscriptions', fullName: SUBSCRIPTIONS_TABLE },
+    { name: 'scan-counts', fullName: SCAN_COUNTS_TABLE },
+    { name: 'scan-history', fullName: SCAN_HISTORY_TABLE },
+    { name: 'tokens', fullName: TOKENS_TABLE },
+    { name: 'purchases', fullName: PURCHASES_TABLE },
+    { name: 'device-scans', fullName: DEVICE_SCANS_TABLE },
+  ];
+
+  return Promise.all(
+    tables.map(async (table) => {
+      try {
+        const desc = await dynamodbRaw.describeTable({ TableName: table.fullName }).promise();
+        return {
+          name: table.name,
+          fullName: table.fullName,
+          itemCount: desc.Table?.ItemCount || 0,
+          sizeBytes: desc.Table?.TableSizeBytes || 0,
+        };
+      } catch (err) {
+        console.error(`Error describing table ${table.fullName}:`, err);
+        return {
+          name: table.name,
+          fullName: table.fullName,
+          itemCount: -1,
+          sizeBytes: -1,
+          error: err.message,
+        };
+      }
+    })
+  );
+}
+
+/**
+ * Get unified activity timeline for a specific user
+ */
+async function getUserActivity(userId, limit = 50, offset = 0) {
+  const [scans, purchases, signupDate] = await Promise.all([
+    (async () => {
+      try {
+        const result = await dynamodb.query({
+          TableName: SCAN_HISTORY_TABLE,
+          KeyConditionExpression: 'userId = :userId',
+          ExpressionAttributeValues: { ':userId': userId },
+        }).promise();
+        return (result.Items || []).map(s => ({
+          type: 'scan',
+          timestamp: s.timestamp || s.createdAt,
+          scanId: s.scanId,
+          status: s.status,
+          label: s.label || null,
+          deepfakeScore: s.deepfakeScore ?? null,
+          s3Url: s.s3Url || null,
+        }));
+      } catch (err) {
+        console.error('Error fetching user scans for activity:', err);
+        return [];
+      }
+    })(),
+    (async () => {
+      try {
+        const result = await dynamodb.query({
+          TableName: PURCHASES_TABLE,
+          IndexName: 'userId-purchaseDate-index',
+          KeyConditionExpression: 'userId = :userId',
+          ExpressionAttributeValues: { ':userId': userId },
+        }).promise();
+        return (result.Items || []).map(p => ({
+          type: 'purchase',
+          timestamp: p.purchaseDate || p.createdAt,
+          purchaseId: p.purchaseId,
+          packId: p.packId,
+          tokens: p.tokens,
+          price: p.price,
+          source: p.source || 'unknown',
+        }));
+      } catch (err) {
+        console.error('Error fetching user purchases for activity:', err);
+        return [];
+      }
+    })(),
+    (async () => {
+      try {
+        const user = await cognito.adminGetUser({
+          UserPoolId: USER_POOL_ID,
+          Username: userId,
+        }).promise();
+        return user.UserCreateDate;
+      } catch (err) {
+        console.error('Error fetching user signup date:', err);
+        return null;
+      }
+    })(),
+  ]);
+
+  const events = [...scans, ...purchases];
+  if (signupDate) {
+    events.push({ type: 'signup', timestamp: new Date(signupDate).toISOString() });
+  }
+
+  events.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+
+  const total = events.length;
+  const paginated = events.slice(offset, offset + limit);
+
+  return { events: paginated, total, count: paginated.length, hasMore: offset + limit < total };
+}
+
+/**
  * Lambda handler
  */
 exports.handler = async (event) => {
@@ -681,6 +996,27 @@ exports.handler = async (event) => {
       };
     }
     
+    // User activity timeline endpoint (must be checked before generic /admin/users GET)
+    if (path.includes('/admin/users') && path.includes('/activity') && method === 'GET') {
+      const userIdMatch = path.match(/\/admin\/users\/([^\/]+)\/activity/);
+      if (!userIdMatch) {
+        return {
+          statusCode: 400,
+          headers,
+          body: JSON.stringify({ success: false, error: 'User ID required' }),
+        };
+      }
+      const userId = userIdMatch[1];
+      const limit = parseInt(queryParams.limit || '50', 10);
+      const offset = parseInt(queryParams.offset || '0', 10);
+      const result = await getUserActivity(userId, limit, offset);
+      return {
+        statusCode: 200,
+        headers,
+        body: JSON.stringify({ success: true, ...result }),
+      };
+    }
+
     // User management endpoints
     if (path.includes('/admin/users') && method === 'GET') {
       // Check if it's a specific user
@@ -973,6 +1309,46 @@ exports.handler = async (event) => {
       };
     }
     
+    // Activity feed endpoint
+    if (path.includes('/admin/analytics/activity') && method === 'GET') {
+      const activity = await getRecentActivity();
+      return {
+        statusCode: 200,
+        headers,
+        body: JSON.stringify({ success: true, activity }),
+      };
+    }
+
+    // User breakdown endpoint
+    if (path.includes('/admin/analytics/breakdown') && method === 'GET') {
+      const breakdown = await getUserBreakdown();
+      return {
+        statusCode: 200,
+        headers,
+        body: JSON.stringify({ success: true, breakdown }),
+      };
+    }
+
+    // System config endpoint
+    if (path.includes('/admin/system/config') && method === 'GET') {
+      const config = getSystemConfig();
+      return {
+        statusCode: 200,
+        headers,
+        body: JSON.stringify({ success: true, config }),
+      };
+    }
+
+    // Table stats endpoint
+    if (path.includes('/admin/system/table-stats') && method === 'GET') {
+      const tables = await getTableStats();
+      return {
+        statusCode: 200,
+        headers,
+        body: JSON.stringify({ success: true, tables }),
+      };
+    }
+
     // Unknown endpoint
     return {
       statusCode: 404,

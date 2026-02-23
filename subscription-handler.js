@@ -5,6 +5,7 @@ const AWS = require('aws-sdk');
 const { v4: uuidv4 } = require('uuid');
 const { wrapHandler, captureException } = require('./middleware/errorHandler');
 const { getDeviceScanCount, hasUserPurchased, getDeviceFreeScanLimit } = require('./device-scan-helpers');
+const { purchaseExistsByTransactionId } = require('./lib/tokens');
 
 // Configure AWS SDK
 const awsConfig = {
@@ -43,7 +44,7 @@ const TOKEN_PACKS = {
 /**
  * Save purchase record to DynamoDB
  */
-async function savePurchase(userId, packId, tokens, price, transactionId) {
+async function savePurchase(userId, packId, tokens, price, transactionId, source) {
   const purchaseId = `purchase-${Date.now()}-${uuidv4()}`;
   const purchaseDate = new Date().toISOString();
   
@@ -54,6 +55,7 @@ async function savePurchase(userId, packId, tokens, price, transactionId) {
     tokens: tokens,
     price: price,
     transactionId: transactionId || null,
+    source: source || 'unknown',
     purchaseDate: purchaseDate,
     status: 'completed',
     createdAt: purchaseDate,
@@ -354,11 +356,32 @@ const handler = async (event) => {
       }
 
       try {
+        // Idempotency: skip if this transaction was already fulfilled (e.g. by webhook)
+        if (transactionId) {
+          const alreadyFulfilled = await purchaseExistsByTransactionId(transactionId);
+          if (alreadyFulfilled) {
+            console.log(`Purchase already fulfilled for transactionId=${transactionId}, returning current balance`);
+            const currentBalance = await getTokenBalance(userId);
+            return {
+              statusCode: 200,
+              headers,
+              body: JSON.stringify({
+                success: true,
+                message: 'Purchase already fulfilled',
+                tokenBalance: currentBalance,
+                scansRemaining: currentBalance,
+                packPurchased: packId,
+                tokensAdded: 0,
+              }),
+            };
+          }
+        }
+
         const pack = TOKEN_PACKS[packId];
         const newBalance = await addTokens(userId, pack.tokens);
 
         // Save purchase record to DynamoDB
-        await savePurchase(userId, packId, pack.tokens, pack.price, transactionId);
+        await savePurchase(userId, packId, pack.tokens, pack.price, transactionId, 'mobile');
 
         return {
           statusCode: 200,

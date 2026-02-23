@@ -4,6 +4,7 @@ require('dotenv').config();
 const AWS = require('aws-sdk');
 const { wrapHandler } = require('./middleware/errorHandler');
 const crypto = require('crypto');
+const { TOKEN_PACKS, mapProductToPackId, addTokens, savePurchase, purchaseExistsByTransactionId } = require('./lib/tokens');
 
 // Configure AWS SDK
 const awsConfig = {
@@ -127,6 +128,45 @@ async function updateSubscription(event) {
 }
 
 /**
+ * Fulfill a token pack purchase from a RevenueCat webhook event.
+ * Uses idempotency check on transaction_id to prevent double-crediting
+ * when the client also calls POST /subscription/purchase.
+ */
+async function fulfillTokenPurchase(event) {
+  const userId = extractUserId(event);
+  if (!userId) {
+    console.warn('[fulfillTokenPurchase] No user ID, skipping');
+    return;
+  }
+
+  const productId = event.product_id || '';
+  const transactionId = event.transaction_id || event.store_transaction_id || '';
+
+  const packId = mapProductToPackId(productId);
+  if (!packId) {
+    console.log(`[fulfillTokenPurchase] Product "${productId}" does not map to a token pack, skipping`);
+    return;
+  }
+
+  if (transactionId) {
+    const alreadyFulfilled = await purchaseExistsByTransactionId(transactionId);
+    if (alreadyFulfilled) {
+      console.log(`[fulfillTokenPurchase] Transaction ${transactionId} already fulfilled, skipping`);
+      return;
+    }
+  }
+
+  const store = (event.store || '').toUpperCase();
+  const source = store === 'PLAY_STORE' ? 'android' : store === 'APP_STORE' ? 'ios' : 'mobile';
+
+  const pack = TOKEN_PACKS[packId];
+  const newBalance = await addTokens(userId, pack.tokens);
+  await savePurchase(userId, packId, pack.tokens, pack.price, transactionId, source);
+
+  console.log(`[fulfillTokenPurchase] Added ${pack.tokens} tokens for user ${userId}, new balance: ${newBalance}`);
+}
+
+/**
  * Handle different webhook event types
  */
 async function handleWebhookEvent(event) {
@@ -138,28 +178,24 @@ async function handleWebhookEvent(event) {
     case 'INITIAL_PURCHASE':
     case 'RENEWAL':
     case 'UNCANCELLATION':
-      // User has active subscription
       await updateSubscription(event);
       break;
 
     case 'CANCELLATION':
-      // User cancelled but still has access until expiration
       await updateSubscription(event);
       break;
 
     case 'EXPIRATION':
-      // Subscription expired
       await updateSubscription(event);
       break;
 
     case 'BILLING_ISSUE':
-      // Payment failed, but give grace period
       await updateSubscription(event);
       break;
 
     case 'NON_RENEWING_PURCHASE':
-      // One-time purchase (if you add this later)
       await updateSubscription(event);
+      await fulfillTokenPurchase(event);
       break;
 
     default:

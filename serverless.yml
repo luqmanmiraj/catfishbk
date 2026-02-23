@@ -4,6 +4,20 @@ service: image-analysis
 # Set AWS_PROFILE environment variable or use --aws-profile flag
 # Example: AWS_PROFILE=myprofile serverless deploy
 
+custom:
+  corsSettings:
+    origin: '*'
+    headers:
+      - Content-Type
+      - X-Amz-Date
+      - Authorization
+      - X-Api-Key
+      - X-Amz-Security-Token
+      - X-Amz-User-Agent
+      - X-Amzn-Trace-Id
+      - X-Device-ID
+      - Device-ID
+
 provider:
   name: aws
   runtime: nodejs18.x
@@ -59,6 +73,13 @@ provider:
     META_ACCESS_TOKEN: ${env:META_ACCESS_TOKEN, ''}
     META_ACCESS_TOKEN_SECRET_NAME: ${env:META_ACCESS_TOKEN_SECRET_NAME, 'catfish/meta-access-token'}
     META_GRAPH_API_VERSION: ${env:META_GRAPH_API_VERSION, 'v22.0'}
+    # Stripe configuration
+    STRIPE_SECRET_KEY: ${env:STRIPE_SECRET_KEY, ''}
+    STRIPE_WEBHOOK_SECRET: ${env:STRIPE_WEBHOOK_SECRET, ''}
+    STRIPE_PRICE_PACK_15: ${env:STRIPE_PRICE_PACK_15, ''}
+    STRIPE_PRICE_PACK_50: ${env:STRIPE_PRICE_PACK_50, ''}
+    STRIPE_PRICE_PACK_100: ${env:STRIPE_PRICE_PACK_100, ''}
+    WEB_APP_URL: ${env:WEB_APP_URL, 'http://localhost:3000'}
   iam:
     role:
       statements:
@@ -108,6 +129,7 @@ provider:
             - dynamodb:Query
             - dynamodb:Scan
             - dynamodb:DeleteItem
+            - dynamodb:DescribeTable
           Resource:
             - !Sub 'arn:aws:dynamodb:${self:provider.region}:*:table/${self:service}-${self:provider.stage}-requests'
             - !Sub 'arn:aws:dynamodb:${self:provider.region}:*:table/${self:service}-${self:provider.stage}-requests/index/*'
@@ -160,195 +182,226 @@ functions:
       - http:
           path: analyze
           method: post
-          cors: true
+          cors: ${self:custom.corsSettings}
   auth:
     handler: auth-handler.handler
     events:
       - http:
           path: auth/signup
           method: post
-          cors: true
+          cors: ${self:custom.corsSettings}
       - http:
           path: auth/guest-signup
           method: post
-          cors: true
+          cors: ${self:custom.corsSettings}
       - http:
           path: auth/signin
           method: post
-          cors: true
+          cors: ${self:custom.corsSettings}
       - http:
           path: auth/confirm-signup
           method: post
-          cors: true
+          cors: ${self:custom.corsSettings}
       - http:
           path: auth/resend-confirmation
           method: post
-          cors: true
+          cors: ${self:custom.corsSettings}
       - http:
           path: auth/forgot-password
           method: post
-          cors: true
+          cors: ${self:custom.corsSettings}
       - http:
           path: auth/confirm-forgot-password
           method: post
-          cors: true
+          cors: ${self:custom.corsSettings}
       - http:
           path: auth/refresh-token
           method: post
-          cors: true
+          cors: ${self:custom.corsSettings}
       - http:
           path: auth/user
           method: get
-          cors: true
+          cors: ${self:custom.corsSettings}
       - http:
           path: auth/delete-account
           method: delete
-          cors: true
+          cors: ${self:custom.corsSettings}
   webhook:
     handler: webhook-handler.handler
     events:
       - http:
           path: webhook
           method: post
-          cors: true
+          cors: ${self:custom.corsSettings}
   subscription:
     handler: subscription-handler.handler
     events:
       - http:
           path: subscription/status
           method: get
-          cors: true
+          cors: ${self:custom.corsSettings}
       - http:
           path: subscription/check
           method: post
-          cors: true
+          cors: ${self:custom.corsSettings}
       - http:
           path: subscription/increment
           method: post
-          cors: true
+          cors: ${self:custom.corsSettings}
       - http:
           path: subscription/decrement
           method: post
-          cors: true
+          cors: ${self:custom.corsSettings}
       - http:
           path: subscription/purchase
           method: post
-          cors: true
+          cors: ${self:custom.corsSettings}
       - http:
           path: subscription/test/add-tokens
           method: post
-          cors: true
+          cors: ${self:custom.corsSettings}
   scanHistory:
     handler: scan-history-handler.handler
     events:
       - http:
           path: scan-history
           method: get
-          cors: true
+          cors: ${self:custom.corsSettings}
       - http:
           path: scan-history
           method: post
-          cors: true
+          cors: ${self:custom.corsSettings}
       - http:
           path: scan-history
           method: patch
-          cors: true
+          cors: ${self:custom.corsSettings}
       - http:
           path: scan-history/{scanId}
           method: patch
-          cors: true
+          cors: ${self:custom.corsSettings}
   gowinston:
     handler: gowinston-handler.handler
     events:
       - http:
           path: gowinston/detect
           method: post
-          cors: true
+          cors: ${self:custom.corsSettings}
   admin:
     handler: admin-handler.handler
     events:
       - http:
           path: admin/auth/verify
           method: post
-          cors: true
+          cors: ${self:custom.corsSettings}
       - http:
           path: admin/users
           method: get
-          cors: true
+          cors: ${self:custom.corsSettings}
       - http:
           path: admin/users/{userId}
           method: get
-          cors: true
+          cors: ${self:custom.corsSettings}
       - http:
           path: admin/users/{userId}
           method: put
-          cors: true
+          cors: ${self:custom.corsSettings}
       - http:
           path: admin/users/{userId}
           method: delete
-          cors: true
+          cors: ${self:custom.corsSettings}
       - http:
           path: admin/users/{userId}/tokens
           method: get
-          cors: true
+          cors: ${self:custom.corsSettings}
       - http:
           path: admin/users/{userId}/tokens/add
           method: post
-          cors: true
+          cors: ${self:custom.corsSettings}
       - http:
           path: admin/users/{userId}/tokens/set
           method: post
-          cors: true
+          cors: ${self:custom.corsSettings}
       - http:
           path: admin/users/{userId}/scans
           method: get
-          cors: true
+          cors: ${self:custom.corsSettings}
       - http:
           path: admin/users/{userId}/purchases
           method: get
-          cors: true
+          cors: ${self:custom.corsSettings}
+      - http:
+          path: admin/users/{userId}/activity
+          method: get
+          cors: ${self:custom.corsSettings}
       - http:
           path: admin/analytics/dashboard
           method: get
-          cors: true
+          cors: ${self:custom.corsSettings}
       - http:
           path: admin/scans
           method: get
-          cors: true
+          cors: ${self:custom.corsSettings}
       - http:
           path: admin/purchases
           method: get
-          cors: true
+          cors: ${self:custom.corsSettings}
+      - http:
+          path: admin/analytics/activity
+          method: get
+          cors: ${self:custom.corsSettings}
+      - http:
+          path: admin/analytics/breakdown
+          method: get
+          cors: ${self:custom.corsSettings}
+      - http:
+          path: admin/system/config
+          method: get
+          cors: ${self:custom.corsSettings}
+      - http:
+          path: admin/system/table-stats
+          method: get
+          cors: ${self:custom.corsSettings}
   metaCapi:
     handler: meta-capi-handler.handler
     events:
       - http:
           path: meta/capi
           method: post
-          cors: true
+          cors: ${self:custom.corsSettings}
       - http:
           path: meta/capi
           method: options
-          cors: true
+          cors: ${self:custom.corsSettings}
+  stripeHandler:
+    handler: stripe-handler.handler
+    events:
+      - http:
+          path: stripe/create-checkout-session
+          method: post
+          cors: ${self:custom.corsSettings}
+      - http:
+          path: stripe/webhook
+          method: post
+          cors: ${self:custom.corsSettings}
   health:
     handler: health-handler.handler
     events:
       - http:
           path: health
           method: get
-          cors: true
+          cors: ${self:custom.corsSettings}
       - http:
           path: health/live
           method: get
-          cors: true
+          cors: ${self:custom.corsSettings}
       - http:
           path: health
           method: options
-          cors: true
+          cors: ${self:custom.corsSettings}
       - http:
           path: health/live
           method: options
-          cors: true
+          cors: ${self:custom.corsSettings}
 
 resources:
   Resources:
