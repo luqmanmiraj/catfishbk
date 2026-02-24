@@ -33,6 +33,29 @@ function getCurrentMonthKey() {
 }
 
 /**
+ * Normalize probability-like values to decimal range [0, 1].
+ * Accepts either decimal input (0..1) or percent input (0..100).
+ */
+function normalizeProbability(value) {
+  if (value === null || value === undefined || value === '') return null;
+
+  const num = Number(value);
+  if (!Number.isFinite(num) || num < 0) return null;
+  if (num <= 1) return num;
+  if (num <= 100) return num / 100;
+  return 1;
+}
+
+function normalizeScanProbabilities(scan) {
+  return {
+    ...scan,
+    deepfakeScore: normalizeProbability(scan.deepfakeScore),
+    aiProbability: normalizeProbability(scan.aiProbability),
+    humanProbability: normalizeProbability(scan.humanProbability),
+  };
+}
+
+/**
  * Extract token from request headers
  */
 function extractToken(event) {
@@ -123,7 +146,7 @@ async function getScanHistory(userId, limit = 50, lastEvaluatedKey = null) {
     const result = await dynamodb.query(params).promise();
     
     // Sort by timestamp (newest first) since scanId is deterministic and doesn't reflect creation time
-    const items = (result.Items || []).sort((a, b) => {
+    const items = (result.Items || []).map(normalizeScanProbabilities).sort((a, b) => {
       const timeA = new Date(a.timestamp || a.createdAt || 0).getTime();
       const timeB = new Date(b.timestamp || b.createdAt || 0).getTime();
       return timeB - timeA; // Descending order (newest first)
@@ -169,6 +192,10 @@ async function createScanHistory(userId, scanData) {
   
   const expiresAt = Math.floor(Date.now() / 1000) + (365 * 24 * 60 * 60);
   
+  const normalizedDeepfakeScore = normalizeProbability(scanData.deepfakeScore);
+  const normalizedAiProbability = normalizeProbability(scanData.aiProbability);
+  const normalizedHumanProbability = normalizeProbability(scanData.humanProbability);
+
   const historyItem = {
     userId: userId,
     scanId: scanId,
@@ -176,9 +203,9 @@ async function createScanHistory(userId, scanData) {
     timestamp: new Date().toISOString(),
     success: scanData.success !== undefined ? scanData.success : true,
     status: scanData.status || 'unknown',
-    deepfakeScore: scanData.deepfakeScore || null,
-    aiProbability: scanData.aiProbability || null,
-    humanProbability: scanData.humanProbability || null,
+    deepfakeScore: normalizedDeepfakeScore,
+    aiProbability: normalizedAiProbability,
+    humanProbability: normalizedHumanProbability,
     sightengineRequestId: scanData.sightengineRequestId || null,
     gowinstonRequestId: scanData.gowinstonRequestId || null,
     s3Url: scanData.s3Url || null,
@@ -206,14 +233,43 @@ async function createScanHistory(userId, scanData) {
   } catch (error) {
     // If conditional put fails due to item already existing, return existing item
     if (error.code === 'ConditionalCheckFailedException') {
-      console.log(`⚠️ Scan with scanId ${scanId} already exists for user ${userId}. Returning existing item.`);
+      console.log(`⚠️ Scan with scanId ${scanId} already exists for user ${userId}. Enriching existing item.`);
       try {
         const existing = await dynamodb.get({
           TableName: SCAN_HISTORY_TABLE,
           Key: { userId: userId, scanId: scanId },
         }).promise();
         if (existing.Item) {
-          return existing.Item;
+          const merged = {
+            ...existing.Item,
+            success: historyItem.success,
+            status: historyItem.status,
+            timestamp: historyItem.timestamp,
+            monthKey: historyItem.monthKey,
+            deepfakeScore: historyItem.deepfakeScore ?? existing.Item.deepfakeScore ?? null,
+            aiProbability: historyItem.aiProbability ?? existing.Item.aiProbability ?? null,
+            humanProbability: historyItem.humanProbability ?? existing.Item.humanProbability ?? null,
+            sightengineRequestId: historyItem.sightengineRequestId || existing.Item.sightengineRequestId || null,
+            gowinstonRequestId: historyItem.gowinstonRequestId || existing.Item.gowinstonRequestId || null,
+            s3Url: historyItem.s3Url || existing.Item.s3Url || null,
+            requestId: historyItem.requestId || existing.Item.requestId || null,
+            source: historyItem.source || existing.Item.source || 'image-analysis',
+            gowinstonApiResponse: historyItem.gowinstonApiResponse || existing.Item.gowinstonApiResponse || null,
+            userResponseJson: historyItem.userResponseJson || existing.Item.userResponseJson || null,
+            readResult: historyItem.readResult || existing.Item.readResult || null,
+            label: historyItem.label || existing.Item.label || null,
+            note: historyItem.note || existing.Item.note || null,
+            createdAt: existing.Item.createdAt || historyItem.createdAt,
+            expiresAt: historyItem.expiresAt,
+            updatedAt: new Date().toISOString(),
+          };
+
+          await dynamodb.put({
+            TableName: SCAN_HISTORY_TABLE,
+            Item: merged,
+          }).promise();
+
+          return merged;
         }
       } catch (getError) {
         console.warn('Could not retrieve existing scan:', getError.message);
@@ -224,6 +280,28 @@ async function createScanHistory(userId, scanData) {
     console.error('❌ Error creating scan history:', error);
     throw error;
   }
+}
+
+function buildReadResultFromScanData(scanData) {
+  if (scanData.readResult) return scanData.readResult;
+
+  const status = scanData.status || 'unknown';
+  const primaryMessage =
+    scanData.primaryMessage ||
+    (status === 'deepfake_detected'
+      ? 'We can say with high confidence that this image was partially or completely created or altered using AI.'
+      : status === 'authentic'
+        ? 'Photo passed authenticity checks. No AI manipulation detected.'
+        : 'Image quality too low or insufficient data to verify authenticity.');
+
+  const headline =
+    status === 'deepfake_detected'
+      ? 'Confirmed Fake / AI Generated'
+      : status === 'authentic'
+        ? 'Likely Real'
+        : 'Inconclusive';
+
+  return `${headline}: ${primaryMessage}`;
 }
 
 /**
@@ -295,6 +373,90 @@ async function updateScanHistory(userId, scanId, updateData) {
     console.error('Error updating scan history:', error);
     throw error;
   }
+}
+
+/**
+ * Delete a scan history item for the authenticated user
+ */
+async function deleteScanHistoryItem(userId, scanId) {
+  if (!userId) {
+    throw new Error('User ID is required');
+  }
+
+  if (!scanId) {
+    throw new Error('Scan ID is required');
+  }
+
+  try {
+    await dynamodb.delete({
+      TableName: SCAN_HISTORY_TABLE,
+      Key: {
+        userId: userId,
+        scanId: scanId,
+      },
+      ConditionExpression: 'attribute_exists(userId) AND attribute_exists(scanId)',
+    }).promise();
+
+    console.log(`✅ Scan history deleted successfully for user: ${userId}, scan: ${scanId}`);
+    return { success: true, userId, scanId };
+  } catch (error) {
+    if (error.code === 'ConditionalCheckFailedException') {
+      throw new Error('Scan not found or access denied');
+    }
+    console.error('Error deleting scan history:', error);
+    throw error;
+  }
+}
+
+/**
+ * Delete all scan history items for the authenticated user
+ */
+async function deleteAllScanHistoryItems(userId) {
+  if (!userId) {
+    throw new Error('User ID is required');
+  }
+
+  let lastEvaluatedKey = null;
+  let totalDeleted = 0;
+
+  do {
+    const queryResult = await dynamodb.query({
+      TableName: SCAN_HISTORY_TABLE,
+      KeyConditionExpression: 'userId = :userId',
+      ExpressionAttributeValues: {
+        ':userId': userId,
+      },
+      ProjectionExpression: 'userId, scanId',
+      ...(lastEvaluatedKey ? { ExclusiveStartKey: lastEvaluatedKey } : {}),
+    }).promise();
+
+    const items = queryResult.Items || [];
+    lastEvaluatedKey = queryResult.LastEvaluatedKey || null;
+
+    if (items.length === 0) {
+      continue;
+    }
+
+    for (let i = 0; i < items.length; i += 25) {
+      const chunk = items.slice(i, i + 25);
+      await dynamodb.batchWrite({
+        RequestItems: {
+          [SCAN_HISTORY_TABLE]: chunk.map((item) => ({
+            DeleteRequest: {
+              Key: {
+                userId: item.userId,
+                scanId: item.scanId,
+              },
+            },
+          })),
+        },
+      }).promise();
+      totalDeleted += chunk.length;
+    }
+  } while (lastEvaluatedKey);
+
+  console.log(`✅ Deleted ${totalDeleted} scan history items for user: ${userId}`);
+  return { success: true, userId, deletedCount: totalDeleted };
 }
 
 /**
@@ -380,17 +542,41 @@ exports.handler = async (event) => {
       const scanData = {
         success: body.success !== undefined ? body.success : true,
         status: body.status,
-        deepfakeScore: body.deepfakeScore || null,
-        aiProbability: body.aiProbability || null,
-        humanProbability: body.humanProbability || null,
+        deepfakeScore: normalizeProbability(body.deepfakeScore),
+        aiProbability: normalizeProbability(body.aiProbability),
+        humanProbability: normalizeProbability(body.humanProbability),
         sightengineRequestId: body.sightengineRequestId || null,
         gowinstonRequestId: body.gowinstonRequestId || null,
         s3Url: body.s3Url || null,
         requestId: body.requestId || null,
         source: body.source || 'image-analysis',
-        gowinstonApiResponse: body.gowinstonApiResponse || null,
-        userResponseJson: body.userResponseJson || null,
-        readResult: body.readResult || null,
+        // Backward-compatible mapping:
+        // - New clients send explicit gowinstonApiResponse/userResponseJson/readResult
+        // - Older clients may only send analysis/rawResponse/primaryMessage
+        gowinstonApiResponse:
+          body.gowinstonApiResponse ||
+          body.rawResponse ||
+          body.analysis?.rawResponse ||
+          body.userResponseJson?.rawResponse ||
+          null,
+        userResponseJson:
+          body.userResponseJson ||
+          body.analysis ||
+          {
+            status: body.status || 'unknown',
+            deepfakeScore: normalizeProbability(body.deepfakeScore),
+            aiProbability: normalizeProbability(body.aiProbability),
+            humanProbability: normalizeProbability(body.humanProbability),
+            requestId: body.requestId || null,
+            source: body.source || 'image-analysis',
+            primaryMessage: body.primaryMessage || null,
+          },
+        readResult: buildReadResultFromScanData({
+          ...body,
+          status: body.status,
+          readResult: body.readResult || null,
+          primaryMessage: body.primaryMessage || body.analysis?.primaryMessage || null,
+        }),
         label: body.label || null,
         note: body.note || null,
       };
@@ -480,6 +666,57 @@ exports.handler = async (event) => {
           success: true,
           scan: updatedScan,
         }),
+      };
+    }
+
+    // Handle DELETE requests for deleting scan history
+    if (event.httpMethod === 'DELETE') {
+      let scanId = null;
+
+      if (event.pathParameters && event.pathParameters.scanId) {
+        scanId = event.pathParameters.scanId;
+      }
+
+      const queryParams = event.queryStringParameters || {};
+      if (!scanId && queryParams.scanId) {
+        scanId = queryParams.scanId;
+      }
+
+      if (!scanId && event.body) {
+        try {
+          const body = typeof event.body === 'string' ? JSON.parse(event.body) : event.body;
+          scanId = body.scanId || null;
+        } catch (e) {
+          // ignore parse errors here, validation below handles missing scanId
+        }
+      }
+
+      const deleteAllRequested = queryParams.all === 'true' || queryParams.deleteAll === 'true';
+      if (!scanId && deleteAllRequested) {
+        const result = await deleteAllScanHistoryItems(userId);
+        return {
+          statusCode: 200,
+          headers,
+          body: JSON.stringify(result),
+        };
+      }
+
+      if (!scanId) {
+        return {
+          statusCode: 400,
+          headers,
+          body: JSON.stringify({
+            success: false,
+            error: 'Scan ID is required (or pass all=true to delete complete history)',
+          }),
+        };
+      }
+
+      const result = await deleteScanHistoryItem(userId, scanId);
+      return {
+        statusCode: 200,
+        headers,
+        body: JSON.stringify(result),
       };
     }
 

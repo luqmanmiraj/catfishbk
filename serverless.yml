@@ -279,6 +279,14 @@ functions:
           path: scan-history/{scanId}
           method: patch
           cors: ${self:custom.corsSettings}
+      - http:
+          path: scan-history
+          method: delete
+          cors: ${self:custom.corsSettings}
+      - http:
+          path: scan-history/{scanId}
+          method: delete
+          cors: ${self:custom.corsSettings}
   gowinston:
     handler: gowinston-handler.handler
     events:
@@ -340,6 +348,10 @@ functions:
       - http:
           path: admin/scans
           method: get
+          cors: ${self:custom.corsSettings}
+      - http:
+          path: admin/scans/{userId}/{scanId}
+          method: delete
           cors: ${self:custom.corsSettings}
       - http:
           path: admin/purchases

@@ -508,13 +508,17 @@ async function saveScanHistory(userId, scanData) {
     timestamp: new Date().toISOString(),
     success: scanData.success || false,
     status: scanData.status || 'unknown',
-    deepfakeScore: scanData.deepfakeScore || null,
-    aiProbability: scanData.aiProbability || null,
-    humanProbability: scanData.humanProbability || null,
+    deepfakeScore: scanData.deepfakeScore ?? null,
+    aiProbability: scanData.aiProbability ?? null,
+    humanProbability: scanData.humanProbability ?? null,
+    creditsRemaining: scanData.creditsRemaining ?? null,
     gowinstonRequestId: scanData.gowinstonRequestId || null,
     s3Url: scanData.s3Url || null,
     requestId: scanData.requestId || null,
     source: 'gowinston',
+    gowinstonApiResponse: scanData.gowinstonApiResponse || null,
+    userResponseJson: scanData.userResponseJson || null,
+    readResult: scanData.readResult || null,
     label: scanData.label || null,
     note: scanData.note || null,
     createdAt: new Date().toISOString(),
@@ -537,7 +541,7 @@ async function saveScanHistory(userId, scanData) {
   } catch (error) {
     // If conditional put fails due to item already existing, that's okay - it's a duplicate
     if (error.code === 'ConditionalCheckFailedException') {
-      console.log(`⚠️ Scan with scanId ${scanId} already exists for user ${userId}. Skipping duplicate save.`);
+      console.log(`⚠️ Scan with scanId ${scanId} already exists for user ${userId}. Enriching existing record.`);
       // Try to get the existing item
       try {
         const existing = await dynamodb.get({
@@ -545,7 +549,40 @@ async function saveScanHistory(userId, scanData) {
           Key: { userId: userId, scanId: scanId },
         }).promise();
         if (existing.Item) {
-          return existing.Item;
+          const merged = {
+            ...existing.Item,
+            // Always refresh latest scan status/timing
+            success: historyItem.success,
+            status: historyItem.status,
+            timestamp: historyItem.timestamp,
+            monthKey: historyItem.monthKey,
+            // Keep canonical values, but don't erase with null
+            deepfakeScore: historyItem.deepfakeScore ?? existing.Item.deepfakeScore ?? null,
+            aiProbability: historyItem.aiProbability ?? existing.Item.aiProbability ?? null,
+            humanProbability: historyItem.humanProbability ?? existing.Item.humanProbability ?? null,
+            creditsRemaining: historyItem.creditsRemaining ?? existing.Item.creditsRemaining ?? null,
+            gowinstonRequestId: historyItem.gowinstonRequestId || existing.Item.gowinstonRequestId || null,
+            s3Url: historyItem.s3Url || existing.Item.s3Url || null,
+            requestId: historyItem.requestId || existing.Item.requestId || null,
+            source: historyItem.source || existing.Item.source || 'gowinston',
+            // Critical admin details: fill if missing or replace with fresh values
+            gowinstonApiResponse: historyItem.gowinstonApiResponse || existing.Item.gowinstonApiResponse || null,
+            userResponseJson: historyItem.userResponseJson || existing.Item.userResponseJson || null,
+            readResult: historyItem.readResult || existing.Item.readResult || null,
+            // Preserve user edits unless a non-empty value is provided
+            label: historyItem.label || existing.Item.label || null,
+            note: historyItem.note || existing.Item.note || null,
+            createdAt: existing.Item.createdAt || historyItem.createdAt,
+            expiresAt: historyItem.expiresAt,
+            updatedAt: new Date().toISOString(),
+          };
+
+          await dynamodb.put({
+            TableName: tableName,
+            Item: merged,
+          }).promise();
+
+          return merged;
         }
       } catch (getError) {
         console.warn('Could not retrieve existing scan:', getError.message);
@@ -562,6 +599,26 @@ async function saveScanHistory(userId, scanData) {
     });
     throw error;
   }
+}
+
+function buildReadResultFromAnalysis(analysis) {
+  const status = analysis?.status || 'unknown';
+  const primaryMessage =
+    analysis?.primaryMessage ||
+    (status === 'deepfake_detected'
+      ? 'We can say with high confidence that this image was partially or completely created or altered using AI.'
+      : status === 'authentic'
+        ? 'Photo passed authenticity checks. No AI manipulation detected.'
+        : 'Image quality too low or insufficient data to verify authenticity.');
+
+  const headline =
+    status === 'deepfake_detected'
+      ? 'Confirmed Fake / AI Generated'
+      : status === 'authentic'
+        ? 'Likely Real'
+        : 'Inconclusive';
+
+  return `${headline}: ${primaryMessage}`;
 }
 
 /**
@@ -749,7 +806,7 @@ function formalizeGowinstonResponse(gowinstonResponse, processingTimeMs = null) 
     iconType: iconType,
     primaryMessage: primaryMessage,
     confidence: confidence,
-    deepfakeScore: aiProbability !== null ? Math.round(aiProbability * 100) / 100 : null,
+    deepfakeScore: aiProbability !== null ? Math.round(aiProbability * 100) / 100 : 0,
     metadata: {
       detectionAlgorithm: `Gowinston AI Detection v${version}`,
       processingTime: processingTime,
@@ -758,7 +815,7 @@ function formalizeGowinstonResponse(gowinstonResponse, processingTimeMs = null) 
     },
     // Backward compatibility fields for mobile app
     ai_generated: resultStatus === 'deepfake_detected',
-    score: score !== null ? score : (aiProbability !== null ? aiProbability : null),
+    score: score !== null ? score : (aiProbability !== null ? aiProbability : 0),
     source: 'Gowinston AI Detection',
     // Include raw response for debugging/advanced use
     rawResponse: gowinstonResponse,
@@ -1073,6 +1130,29 @@ exports.handler = async (event) => {
       }
     }
 
+    // Persist scan history immediately so admin always has full details,
+    // even before user taps "Save to History" in client apps.
+    let savedScan = null;
+    try {
+      savedScan = await saveScanHistory(userId, {
+        success: true,
+        status: formalizedResponse.status || 'unknown',
+        deepfakeScore: formalizedResponse.deepfakeScore ?? null,
+        aiProbability: formalizedResponse.aiProbability ?? null,
+        humanProbability: formalizedResponse.humanProbability ?? null,
+        creditsRemaining: formalizedResponse.creditsRemaining ?? null,
+        gowinstonRequestId: deviceInfo.requestId || null,
+        s3Url: s3Url || null,
+        requestId: deviceInfo.requestId || null,
+        gowinstonApiResponse: gowinstonResult.data || null,
+        userResponseJson: formalizedResponse,
+        readResult: buildReadResultFromAnalysis(formalizedResponse),
+      });
+    } catch (historyError) {
+      // Do not fail scan response if history save fails.
+      console.error('❌ Failed to save scan history in gowinston handler:', historyError);
+    }
+
     // Prepare response with token balance
     // Note: Scan history is now saved manually by user via "Save to History" button
     const response = {
@@ -1089,6 +1169,7 @@ exports.handler = async (event) => {
         }),
         // Include request tracking info for manual history save
         requestId: deviceInfo.requestId,
+        scanId: savedScan?.scanId || null,
       }),
     };
 

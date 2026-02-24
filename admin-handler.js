@@ -46,6 +46,68 @@ function getCorsHeaders() {
 }
 
 /**
+ * Normalize probability-like values to decimal range [0, 1].
+ * Accepts either decimal input (0..1) or percent input (0..100).
+ */
+function normalizeProbability(value) {
+  if (value === null || value === undefined || value === '') return null;
+
+  const num = Number(value);
+  if (!Number.isFinite(num) || num < 0) return null;
+  if (num <= 1) return num;
+  if (num <= 100) return num / 100;
+  return 1;
+}
+
+function normalizeScanRecord(scan) {
+  if (!scan || typeof scan !== 'object') return scan;
+
+  return {
+    ...scan,
+    deepfakeScore: normalizeProbability(scan.deepfakeScore),
+    aiProbability: normalizeProbability(scan.aiProbability),
+    humanProbability: normalizeProbability(scan.humanProbability),
+  };
+}
+
+function extractCreditsRemaining(scan) {
+  if (!scan || typeof scan !== 'object') return null;
+
+  const candidates = [
+    scan.creditsRemaining,
+    scan.analysis?.creditsRemaining,
+    scan.analysis?.rawResponse?.credits_remaining,
+    scan.analysis?.rawResponse?.creditsRemaining,
+    scan.userResponseJson?.creditsRemaining,
+    scan.userResponseJson?.analysis?.creditsRemaining,
+    scan.userResponseJson?.analysis?.rawResponse?.credits_remaining,
+    scan.userResponseJson?.analysis?.rawResponse?.creditsRemaining,
+    scan.userResponseJson?.rawResponse?.credits_remaining,
+    scan.userResponseJson?.rawResponse?.creditsRemaining,
+    scan.gowinstonApiResponse?.credits_remaining,
+    scan.gowinstonApiResponse?.creditsRemaining,
+  ];
+
+  for (const candidate of candidates) {
+    const parsed = Number(candidate);
+    if (Number.isFinite(parsed) && parsed >= 0) {
+      return parsed;
+    }
+  }
+
+  return null;
+}
+
+function extractScanTimestampMs(scan) {
+  if (!scan || typeof scan !== 'object') return 0;
+  const rawTimestamp = scan.timestamp || scan.createdAt;
+  if (!rawTimestamp) return 0;
+
+  const parsed = new Date(rawTimestamp).getTime();
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+/**
  * Handle preflight OPTIONS request
  */
 function handleOptions() {
@@ -450,14 +512,38 @@ async function getDashboardAnalytics() {
       console.error('Error getting user count:', error);
     }
     
-    // Get total scans count
+    // Get total scans count and latest GoWinston credits remaining
     let totalScans = 0;
+    let gowinstonCreditsRemaining = null;
+    let gowinstonCreditsUpdatedAt = null;
+    let latestCreditsTimestamp = 0;
     try {
-      const scanResult = await dynamodb.scan({
-        TableName: SCAN_HISTORY_TABLE,
-        Select: 'COUNT',
-      }).promise();
-      totalScans = scanResult.Count || 0;
+      let lastEvaluatedKey = null;
+      do {
+        const scanResult = await dynamodb.scan({
+          TableName: SCAN_HISTORY_TABLE,
+          ...(lastEvaluatedKey ? { ExclusiveStartKey: lastEvaluatedKey } : {}),
+          ProjectionExpression: '#ts, createdAt, userResponseJson, gowinstonApiResponse, creditsRemaining',
+          ExpressionAttributeNames: { '#ts': 'timestamp' },
+        }).promise();
+
+        const items = scanResult.Items || [];
+        totalScans += items.length;
+
+        for (const item of items) {
+          const creditsRemaining = extractCreditsRemaining(item);
+          if (creditsRemaining === null) continue;
+
+          const timestampMs = extractScanTimestampMs(item);
+          if (timestampMs >= latestCreditsTimestamp) {
+            latestCreditsTimestamp = timestampMs;
+            gowinstonCreditsRemaining = creditsRemaining;
+            gowinstonCreditsUpdatedAt = new Date(timestampMs).toISOString();
+          }
+        }
+
+        lastEvaluatedKey = scanResult.LastEvaluatedKey || null;
+      } while (lastEvaluatedKey);
     } catch (error) {
       console.error('Error getting scan count:', error);
     }
@@ -492,6 +578,8 @@ async function getDashboardAnalytics() {
       totalPurchases: totalPurchases,
       totalRevenue: totalRevenue,
       totalTokens: totalTokens,
+      gowinstonCreditsRemaining: gowinstonCreditsRemaining,
+      gowinstonCreditsUpdatedAt: gowinstonCreditsUpdatedAt,
     };
   } catch (error) {
     console.error('Error getting dashboard analytics:', error);
@@ -519,8 +607,9 @@ async function getUserScans(userId, limit = 50, lastEvaluatedKey = null) {
   
   try {
     const result = await dynamodb.query(params).promise();
+    const normalizedScans = (result.Items || []).map(normalizeScanRecord);
     return {
-      scans: result.Items || [],
+      scans: normalizedScans,
       lastEvaluatedKey: result.LastEvaluatedKey || null,
       count: result.Count || 0,
     };
@@ -534,24 +623,74 @@ async function getUserScans(userId, limit = 50, lastEvaluatedKey = null) {
  * Get all scans with pagination
  */
 async function getAllScans(limit = 50, lastEvaluatedKey = null) {
-  const params = {
-    TableName: SCAN_HISTORY_TABLE,
-    Limit: limit,
-  };
-  
-  if (lastEvaluatedKey) {
-    params.ExclusiveStartKey = lastEvaluatedKey;
-  }
-  
+  // NOTE:
+  // DynamoDB Scan + ExclusiveStartKey does not provide global time ordering.
+  // To ensure admin pagination is truly "recent first" across ALL pages,
+  // we load all scans, sort globally, then paginate via offset cursor.
+  const offset =
+    lastEvaluatedKey &&
+    typeof lastEvaluatedKey === 'object' &&
+    Number.isFinite(lastEvaluatedKey.offset)
+      ? Math.max(0, Number(lastEvaluatedKey.offset))
+      : 0;
+
   try {
-    const result = await dynamodb.scan(params).promise();
+    const allScans = [];
+    let exclusiveStartKey = null;
+
+    do {
+      const page = await dynamodb.scan({
+        TableName: SCAN_HISTORY_TABLE,
+        ...(exclusiveStartKey ? { ExclusiveStartKey: exclusiveStartKey } : {}),
+      }).promise();
+
+      allScans.push(...(page.Items || []));
+      exclusiveStartKey = page.LastEvaluatedKey || null;
+    } while (exclusiveStartKey);
+
+    // Global sort by full datetime (date + time), newest first
+    const sortedItems = allScans
+      .map(normalizeScanRecord)
+      .sort((a, b) => {
+      return new Date(b.timestamp || b.createdAt) - new Date(a.timestamp || a.createdAt);
+    });
+
+    const pagedItems = sortedItems.slice(offset, offset + limit);
+    const nextOffset = offset + pagedItems.length;
+    const nextCursor = nextOffset < sortedItems.length ? { offset: nextOffset } : null;
+
     return {
-      scans: result.Items || [],
-      lastEvaluatedKey: result.LastEvaluatedKey || null,
-      count: result.Count || 0,
+      scans: pagedItems,
+      lastEvaluatedKey: nextCursor,
+      count: pagedItems.length,
     };
   } catch (error) {
     console.error('Error getting all scans:', error);
+    throw error;
+  }
+}
+
+/**
+ * Delete a scan record by userId + scanId
+ */
+async function deleteScanRecord(userId, scanId) {
+  if (!userId || !scanId) {
+    throw new Error('User ID and scan ID are required');
+  }
+
+  try {
+    await dynamodb.delete({
+      TableName: SCAN_HISTORY_TABLE,
+      Key: { userId, scanId },
+      ConditionExpression: 'attribute_exists(userId) AND attribute_exists(scanId)',
+    }).promise();
+
+    return { success: true, userId, scanId };
+  } catch (error) {
+    if (error.code === 'ConditionalCheckFailedException') {
+      throw new Error('Scan not found');
+    }
+    console.error('Error deleting scan record:', error);
     throw error;
   }
 }
@@ -872,7 +1011,7 @@ async function getUserActivity(userId, limit = 50, offset = 0) {
           scanId: s.scanId,
           status: s.status,
           label: s.label || null,
-          deepfakeScore: s.deepfakeScore ?? null,
+          deepfakeScore: normalizeProbability(s.deepfakeScore),
           s3Url: s.s3Url || null,
         }));
       } catch (err) {
@@ -1244,6 +1383,30 @@ exports.handler = async (event) => {
       };
     }
     
+    if (path.includes('/admin/scans') && method === 'DELETE' && !path.includes('/users/')) {
+      const scanPathMatch = path.match(/\/admin\/scans\/([^\/]+)\/([^\/]+)$/);
+      const userId = scanPathMatch ? decodeURIComponent(scanPathMatch[1]) : queryParams.userId;
+      const scanId = scanPathMatch ? decodeURIComponent(scanPathMatch[2]) : queryParams.scanId;
+
+      if (!userId || !scanId) {
+        return {
+          statusCode: 400,
+          headers,
+          body: JSON.stringify({
+            success: false,
+            error: 'userId and scanId are required',
+          }),
+        };
+      }
+
+      const result = await deleteScanRecord(userId, scanId);
+      return {
+        statusCode: 200,
+        headers,
+        body: JSON.stringify(result),
+      };
+    }
+
     if (path.includes('/admin/scans') && method === 'GET' && !path.includes('/users/')) {
       const limit = parseInt(queryParams.limit || '50', 10);
       const lastEvaluatedKey = queryParams.lastEvaluatedKey 

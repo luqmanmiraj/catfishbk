@@ -577,7 +577,7 @@ async function saveScanHistory(userId, scanData) {
     timestamp: new Date().toISOString(),
     success: scanData.success || false,
     status: scanData.status || 'unknown',
-    deepfakeScore: scanData.deepfakeScore || null,
+    deepfakeScore: scanData.deepfakeScore ?? null,
     sightengineRequestId: scanData.sightengineRequestId || null,
     s3Url: scanData.s3Url || null,
     requestId: scanData.requestId || null,
@@ -779,7 +779,7 @@ function formalizeDeepfakeResponse(sightengineResponse, processingTimeMs = null)
     iconType: iconType,
     primaryMessage: primaryMessage,
     confidence: confidence,
-    deepfakeScore: deepfakeScore !== null ? Math.round(deepfakeScore * 100) / 100 : null,
+    deepfakeScore: deepfakeScore !== null ? Math.round(deepfakeScore * 100) / 100 : 0,
     metadata: {
       detectionAlgorithm: 'AI Pattern Recognition v2.1',
       processingTime: processingTime,
@@ -787,7 +787,7 @@ function formalizeDeepfakeResponse(sightengineResponse, processingTimeMs = null)
     },
     // Backward compatibility fields for mobile app
     ai_generated: resultStatus === 'deepfake_detected',
-    score: deepfakeScore !== null ? deepfakeScore : null,
+    score: deepfakeScore !== null ? deepfakeScore : 0,
     source: 'Sightengine Deepfake Detection',
     // Include raw response for debugging/advanced use
     rawResponse: sightengineResponse,
