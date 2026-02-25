@@ -37,8 +37,8 @@ const TOKEN_PACKS = {
   'pack_5': { tokens: 5, price: 4.99 },
   'pack_15': { tokens: 15, price: 4.99 },
   'pack_20': { tokens: 20, price: 14.99 },
-  'pack_50': { tokens: 50, price: 8.49 },
-  'pack_100': { tokens: 100, price: 14.44 },
+  'pack_50': { tokens: 50, price: 9.99 },
+  'pack_100': { tokens: 100, price: 16.99 },
 };
 
 /**
