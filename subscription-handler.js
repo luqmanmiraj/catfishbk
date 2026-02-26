@@ -41,6 +41,22 @@ const TOKEN_PACKS = {
   'pack_100': { tokens: 100, price: 16.99 },
 };
 
+function normalizeTransactionId(transactionId) {
+  if (typeof transactionId !== 'string') return null;
+  const trimmed = transactionId.trim();
+  if (!trimmed) return null;
+
+  // Guard against client bugs sending purchase dates instead of transaction IDs.
+  const isIsoTimestamp = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(trimmed);
+  return isIsoTimestamp ? null : trimmed;
+}
+
+function logPurchaseBanner(message, data = {}) {
+  console.log('*********** PURCHASE FLOW ***********');
+  console.log(message, data);
+  console.log('*********** PURCHASE FLOW ***********');
+}
+
 /**
  * Save purchase record to DynamoDB
  */
@@ -343,8 +359,16 @@ const handler = async (event) => {
     if (method === 'POST' && path.includes('/purchase')) {
       const body = typeof event.body === 'string' ? JSON.parse(event.body || '{}') : (event.body || {});
       const { packId, transactionId } = body;
+      const normalizedTransactionId = normalizeTransactionId(transactionId);
+      logPurchaseBanner('Purchase request received', {
+        userId,
+        packId,
+        transactionId,
+        normalizedTransactionId,
+      });
 
       if (!packId || !TOKEN_PACKS[packId]) {
+        logPurchaseBanner('Purchase request rejected: invalid pack ID', { userId, packId });
         return {
           statusCode: 400,
           headers,
@@ -357,11 +381,17 @@ const handler = async (event) => {
 
       try {
         // Idempotency: skip if this transaction was already fulfilled (e.g. by webhook)
-        if (transactionId) {
-          const alreadyFulfilled = await purchaseExistsByTransactionId(transactionId);
+        if (normalizedTransactionId) {
+          const alreadyFulfilled = await purchaseExistsByTransactionId(normalizedTransactionId);
           if (alreadyFulfilled) {
-            console.log(`Purchase already fulfilled for transactionId=${transactionId}, returning current balance`);
+            console.log(`Purchase already fulfilled for transactionId=${normalizedTransactionId}, returning current balance`);
             const currentBalance = await getTokenBalance(userId);
+            logPurchaseBanner('Purchase deduped (already fulfilled)', {
+              userId,
+              packId,
+              normalizedTransactionId,
+              currentBalance,
+            });
             return {
               statusCode: 200,
               headers,
@@ -381,7 +411,14 @@ const handler = async (event) => {
         const newBalance = await addTokens(userId, pack.tokens);
 
         // Save purchase record to DynamoDB
-        await savePurchase(userId, packId, pack.tokens, pack.price, transactionId, 'mobile');
+        await savePurchase(userId, packId, pack.tokens, pack.price, normalizedTransactionId, 'mobile');
+        logPurchaseBanner('Purchase completed successfully', {
+          userId,
+          packId,
+          tokensAdded: pack.tokens,
+          normalizedTransactionId,
+          newBalance,
+        });
 
         return {
           statusCode: 200,
@@ -397,6 +434,12 @@ const handler = async (event) => {
         };
       } catch (error) {
         console.error('Error adding tokens:', error);
+        logPurchaseBanner('Purchase failed', {
+          userId,
+          packId,
+          normalizedTransactionId,
+          error: error.message,
+        });
         return {
           statusCode: 500,
           headers,
